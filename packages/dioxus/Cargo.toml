@@ -22,7 +22,7 @@ dioxus-signals = { workspace = true, optional = true }
 dioxus-router = { workspace = true, optional = true }
 dioxus-web = { workspace = true, default-features = false, optional = true }
 dioxus-mobile = { workspace = true, optional = true }
-dioxus-desktop = { workspace = true, default-features = true, optional = true }
+dioxus-desktop = { workspace = true, default-features = false, optional = true }
 dioxus-fullstack = { workspace = true, default-features = true, optional = true }
 dioxus-liveview = { workspace = true, optional = true }
 dioxus-ssr = { workspace = true, optional = true }
