@@ -67,6 +67,7 @@ pub struct Config {
     pub(crate) custom_index: Option<String>,
     pub(crate) root_name: String,
     pub(crate) background_color: Option<(u8, u8, u8, u8)>,
+    pub(crate) background_throttling: Option<wry::BackgroundThrottlingPolicy>,
     pub(crate) exit_on_last_window_close: bool,
     pub(crate) window_close_behavior: WindowCloseBehaviour,
     pub(crate) custom_event_handler: Option<CustomEventHandler>,
@@ -121,6 +122,7 @@ impl Config {
             custom_index: None,
             root_name: "main".to_string(),
             background_color: None,
+            background_throttling: None,
             exit_on_last_window_close: true,
             window_close_behavior: WindowCloseBehaviour::WindowCloses,
             custom_event_handler: None,
@@ -296,6 +298,15 @@ impl Config {
     /// This is akin to calling React.render() on the element with the specified name.
     pub fn with_root_name(mut self, name: impl Into<String>) -> Self {
         self.root_name = name.into();
+        self
+    }
+
+    /// Sets the background throttling policy of the WebView.
+    ///
+    /// This is useful for windows that are never focused, such as overlays, where
+    /// WebKit would otherwise throttle rendering when the window is inactive.
+    pub fn with_background_throttling(mut self, policy: wry::BackgroundThrottlingPolicy) -> Self {
+        self.background_throttling = Some(policy);
         self
     }
 

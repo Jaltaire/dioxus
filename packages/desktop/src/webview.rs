@@ -356,7 +356,11 @@ impl WebviewInstance {
         let navigation_handler = cfg.navigation_handler.take();
         let page_loaded = AtomicBool::new(false);
 
-        let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
+        let mut webview = WebViewBuilder::new_with_web_context(&mut web_context);
+        if let Some(policy) = cfg.background_throttling.take() {
+            webview = webview.with_background_throttling(policy);
+        }
+        let mut webview = webview
             .with_bounds(wry::Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
                 size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
