@@ -350,7 +350,13 @@ impl WebviewInstance {
         };
 
         let navigation_handler = cfg.navigation_handler.take();
-        let page_loaded = AtomicBool::new(false);
+        // Whether the page is up and talking to us.
+        //
+        // Shared rather than owned by the navigation handler alone, because the
+        // web content process can die underneath a running application -- iOS
+        // reclaims it while the app is in the background -- and when it does,
+        // the page this guards is already gone.
+        let page_loaded = Arc::new(AtomicBool::new(false));
 
         let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_bounds(wry::Rect {
@@ -363,7 +369,9 @@ impl WebviewInstance {
             .with_transparent(cfg.window.window.transparent)
             .with_url("dioxus://index.html/")
             .with_ipc_handler(ipc_handler)
-            .with_navigation_handler(move |var| {
+            .with_navigation_handler({
+                let page_loaded = page_loaded.clone();
+                move |var: String| {
                 // Serve the index and assets.
                 if var.starts_with("dioxus://")
                     || var.starts_with("http://dioxus.")
@@ -386,8 +394,34 @@ impl WebviewInstance {
                 // By default, external links are allowed. This keeps things like iframes working.
                 // However, users can customize this to allow/disallow domains/routes/patterns.
                 navigation_handler.as_ref().map(|f| f(&var)).unwrap_or(true)
+                }
             })
             .with_asynchronous_custom_protocol(String::from("dioxus"), request_handler);
+
+        // The web content process is not ours to keep. iOS reclaims it from a
+        // backgrounded application, and when the application is opened again
+        // the view is still there with nothing in it -- which the platform
+        // itself tries to put right by reloading the page.
+        //
+        // That reload is a navigation to `dioxus://`, and the guard above
+        // refuses every one of those after the first, so the reload is
+        // cancelled and the application is left showing an empty webview until
+        // it is force quit. Clearing the flag is the whole of the fix: the page
+        // it was guarding no longer exists, so there is nothing left to guard,
+        // and the next load is allowed exactly once more.
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        {
+            use wry::WebViewBuilderExtDarwin;
+
+            let page_loaded = page_loaded.clone();
+            webview = webview.with_on_web_content_process_terminate_handler(move || {
+                tracing::warn!(
+                    "The web content process was terminated. The page will be allowed to load \
+                     again so the application can come back."
+                );
+                page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        };
 
         // Enable https scheme on android, needed for secure context API, like the geolocation API
         #[cfg(target_os = "android")]
