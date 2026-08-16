@@ -356,14 +356,20 @@ impl EditWebsocket {
                 }
             }
 
-            // If the webview was already connected, never send edits from the old connection to
-            // the new connection. This should never happen
+            // A webview that is already connected has had its page replaced. That
+            // happens when the process drawing it is terminated by the platform
+            // and the page is loaded again: the old page never closed its
+            // connection, because it did not get the chance.
+            //
+            // The old connection is dropped rather than kept, and nothing
+            // queued against it is carried over -- those edits describe a page
+            // that no longer exists. The new one is rebuilt from the virtual dom
+            // when it reports in, which is the whole of what it needs.
             Some(WebviewConnectionState::Connected { .. }) => {
-                tracing::error!(
-                    "Webview {} was already connected. Rejecting new connection.",
+                tracing::debug!(
+                    "Webview {} connected again, so the connection before it is dropped.",
                     location.webview_id
                 );
-                return;
             }
 
             None => {}
