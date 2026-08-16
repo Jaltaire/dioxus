@@ -43,7 +43,11 @@ impl Document for DesktopDocument {
     fn create_meta(&self, props: MetaProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("meta", &props.attributes(), None));
+            let js = create_element_in_head("meta", &props.attributes(), None);
+            if let Some(ctx) = myself.desktop_ctx.upgrade() {
+                ctx.remember_head_element(js.clone());
+            }
+            myself.eval(js);
         });
     }
 
@@ -51,11 +55,11 @@ impl Document for DesktopDocument {
     fn create_script(&self, props: ScriptProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
-                "script",
-                &props.attributes(),
-                props.script_contents().ok(),
-            ));
+            let js = create_element_in_head("script", &props.attributes(), props.script_contents().ok());
+            if let Some(ctx) = myself.desktop_ctx.upgrade() {
+                ctx.remember_head_element(js.clone());
+            }
+            myself.eval(js);
         });
     }
 
@@ -63,11 +67,11 @@ impl Document for DesktopDocument {
     fn create_style(&self, props: StyleProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
-                "style",
-                &props.attributes(),
-                props.style_contents().ok(),
-            ));
+            let js = create_element_in_head("style", &props.attributes(), props.style_contents().ok());
+            if let Some(ctx) = myself.desktop_ctx.upgrade() {
+                ctx.remember_head_element(js.clone());
+            }
+            myself.eval(js);
         });
     }
 
@@ -75,7 +79,11 @@ impl Document for DesktopDocument {
     fn create_link(&self, props: LinkProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("link", &props.attributes(), None));
+            let js = create_element_in_head("link", &props.attributes(), None);
+            if let Some(ctx) = myself.desktop_ctx.upgrade() {
+                ctx.remember_head_element(js.clone());
+            }
+            myself.eval(js);
         });
     }
 }

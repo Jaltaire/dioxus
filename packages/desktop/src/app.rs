@@ -299,6 +299,11 @@ impl App {
             return;
         };
 
+        // The page that died never closed its connection, so what is sent next
+        // would go to a channel nothing is reading. Forgetting it first means
+        // the edits that rebuild the new page are queued for it instead.
+        view.edits.wry_queue.forget_connection();
+
         if let Err(error) = view.desktop_context.webview.load_url("dioxus://index.html/") {
             tracing::error!(
                 "The page could not be loaded again after its web content process was \
@@ -318,6 +323,14 @@ impl App {
             .with_mutation_state_mut(|f| view.dom.rebuild(f));
 
         view.edits.wry_queue.send_edits();
+
+        // Anything the document put into the head belongs to the page that had
+        // it, and a page that has replaced another starts with an empty one.
+        // The components that put them there will not do it again -- their
+        // hooks have already run, and re-running the virtual dom does not reset
+        // those -- so they are put back from what the window remembers. On a
+        // first load nothing is remembered yet and this does nothing.
+        view.desktop_context.replay_head_elements();
 
         #[cfg(not(target_os = "linux"))]
         {

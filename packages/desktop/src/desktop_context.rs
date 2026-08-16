@@ -9,6 +9,7 @@ use crate::{
     webview::PendingWebview,
 };
 use dioxus_core::{Callback, VirtualDom};
+use std::cell::RefCell;
 use std::{
     cell::Cell,
     future::{Future, IntoFuture},
@@ -74,6 +75,16 @@ pub struct DesktopService {
     pub(crate) file_hover: NativeFileHover,
     pub(crate) close_behaviour: Rc<Cell<WindowCloseBehaviour>>,
 
+    /// The head elements this window's document has put into its page.
+    ///
+    /// Kept because a page can be replaced underneath a running application --
+    /// the platform terminates the process drawing it and it is loaded again --
+    /// and the components that put these there will not do so a second time.
+    /// Their hooks have already run, and re-running the virtual dom does not
+    /// reset those, so without this record the new page has an empty head and
+    /// the application is rendered into a document with no styling.
+    pub(crate) head_elements: Rc<RefCell<Vec<String>>>,
+
     #[cfg(target_os = "ios")]
     pub(crate) views: Rc<std::cell::RefCell<Vec<Retained<UIView>>>>,
 }
@@ -103,6 +114,7 @@ impl DesktopService {
             asset_handlers,
             file_hover,
             close_behaviour: Rc::new(Cell::new(close_behaviour)),
+            head_elements: Rc::new(RefCell::new(Vec::new())),
             query: Default::default(),
             #[cfg(target_os = "ios")]
             views: Default::default(),
@@ -172,6 +184,27 @@ impl DesktopService {
     /// Toggle whether the window is maximized or not
     pub fn toggle_maximized(&self) {
         self.window.set_maximized(!self.window.is_maximized())
+    }
+
+    /// Records a script that puts an element into the head, so that it can be
+    /// put into a page that replaces this one.
+    pub(crate) fn remember_head_element(&self, js: String) {
+        self.head_elements.borrow_mut().push(js);
+    }
+
+    /// Puts every remembered head element into the page again.
+    ///
+    /// Called once a page that replaced another is ready. On a page that
+    /// replaced nothing there is nothing remembered yet, so this does nothing.
+    pub(crate) fn replay_head_elements(&self) {
+        let scripts = self.head_elements.borrow().clone();
+        if scripts.is_empty() {
+            return;
+        }
+        tracing::debug!("Putting {} head elements back into the new page.", scripts.len());
+        for js in scripts {
+            self.webview.evaluate_script(&js).ok();
+        }
     }
 
     /// Set the close behavior of this window

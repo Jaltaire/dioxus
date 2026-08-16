@@ -52,6 +52,31 @@ impl WryQueue {
     }
 
     /// Send a list of mutations to the webview
+    /// Forgets the connection this webview's page had, so that edits sent from
+    /// here on are queued for the page that replaces it.
+    ///
+    /// Used when the process drawing the page is terminated by the platform.
+    /// The page never closed its connection -- it did not get the chance -- so
+    /// without this the edits rebuilding the new page are handed to a channel
+    /// nothing is reading and the window stays empty.
+    pub(crate) fn forget_connection(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .websocket
+            .forget_connection(inner.location.webview_id);
+        // The page owed an acknowledgement for the last edits it was sent, and
+        // cannot give one now. Left in place it is waited on for good: the
+        // virtual dom is held back until the edits in flight are flushed, so
+        // nothing would ever be rendered into the page that replaces this one.
+        inner.edits_in_progress = None;
+        // Templates are sent to a page once and referred to by number ever
+        // after. A page that has just been loaded knows none of them, so
+        // without this the rebuild refers to templates the new page has never
+        // been given and builds nothing at all -- which looks exactly like the
+        // empty window this is all meant to cure.
+        inner.mutation_state = MutationState::default();
+    }
+
     pub(crate) fn send_edits(&self) {
         let mut myself = self.inner.borrow_mut();
         let webview_id = myself.location.webview_id;
@@ -397,6 +422,14 @@ impl EditWebsocket {
                 mutation_state: MutationState::default(),
             })),
         }
+    }
+
+    /// Puts a webview back to waiting for its first connection.
+    fn forget_connection(&self, webview: u32) {
+        self.connections
+            .write()
+            .unwrap()
+            .insert(webview, WebviewConnectionState::default());
     }
 
     fn send_edits(&mut self, webview: u32, edits: Vec<u8>) -> oneshot::Receiver<()> {
