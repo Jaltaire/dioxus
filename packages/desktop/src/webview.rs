@@ -414,12 +414,16 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtDarwin;
 
             let page_loaded = page_loaded.clone();
+            let (proxy, window_id) = (shared.proxy.to_owned(), window.id());
             webview = webview.with_on_web_content_process_terminate_handler(move || {
                 tracing::warn!(
-                    "The web content process was terminated. The page will be allowed to load \
-                     again so the application can come back."
+                    "The web content process was terminated. The page will be loaded again so \
+                     the application can come back."
                 );
+                // Cleared before the reload is asked for, because the guard
+                // would refuse the very navigation being asked for.
                 page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+                _ = proxy.send_event(UserWindowEvent::WebContentProcessTerminated(window_id));
             });
         };
 

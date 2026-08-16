@@ -284,6 +284,29 @@ impl App {
         }
     }
 
+    /// The process drawing a window's page has been terminated by the platform.
+    ///
+    /// The application itself is untouched -- its state, its tasks and its
+    /// virtual dom are all still here -- but the page they were being drawn
+    /// into is gone, and what a member sees is an empty webview in whatever
+    /// colour it was told to paint. Loading the page again is all that is
+    /// needed: it reports in when it is ready, and the whole dom is rebuilt
+    /// into it from the virtual dom that never went anywhere.
+    ///
+    /// iOS does this to an application that has been in the background a while.
+    pub fn reload_after_web_content_process_terminated(&mut self, id: WindowId) {
+        let Some(view) = self.webviews.get(&id) else {
+            return;
+        };
+
+        if let Err(error) = view.desktop_context.webview.load_url("dioxus://index.html/") {
+            tracing::error!(
+                "The page could not be loaded again after its web content process was \
+                 terminated, so the window will stay empty: {error}"
+            );
+        }
+    }
+
     /// The webview is finally loaded
     ///
     /// Let's rebuild it and then start polling it

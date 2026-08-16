@@ -20,6 +20,11 @@ pub enum UserWindowEvent {
     /// Poll the virtualdom
     Poll(WindowId),
 
+    /// The process drawing this window's page has been terminated by the
+    /// platform, so the page it was showing no longer exists and has to be
+    /// loaded again.
+    WebContentProcessTerminated(WindowId),
+
     /// Handle an ipc message eminating from the window.postMessage of a given webview
     Ipc {
         id: WindowId,
