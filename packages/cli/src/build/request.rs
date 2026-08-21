@@ -1435,7 +1435,7 @@ impl BuildRequest {
         exe: &Path,
         ctx: &BuildContext,
     ) -> Result<AppManifest> {
-        use super::assets::extract_symbols_from_file;
+        use super::assets::{BinarySourcePathPolicy, extract_symbols_from_file};
 
         let skip_assets = self.skip_assets;
         let needs_android_artifacts = self.bundle == BundleFormat::Android;
@@ -1447,7 +1447,11 @@ impl BuildRequest {
 
         ctx.status_extracting_assets();
 
-        let mut manifest = extract_symbols_from_file(exe).await?;
+        let source_path_policy = match self.release {
+            true => BinarySourcePathPolicy::Redact,
+            false => BinarySourcePathPolicy::Preserve,
+        };
+        let mut manifest = extract_symbols_from_file(exe, source_path_policy).await?;
 
         if matches!(self.bundle, BundleFormat::Web)
             && matches!(ctx.mode, BuildMode::Base | BuildMode::Fat)

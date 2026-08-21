@@ -167,6 +167,24 @@ enum AssetRepresentation {
     SymbolData,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BinarySourcePathPolicy {
+    Preserve,
+    Redact,
+}
+
+fn asset_for_binary(
+    asset: BundledAsset,
+    source_path_policy: BinarySourcePathPolicy,
+) -> BundledAsset {
+    match source_path_policy {
+        BinarySourcePathPolicy::Preserve => asset,
+        BinarySourcePathPolicy::Redact => {
+            BundledAsset::new("", asset.bundled_path(), *asset.options())
+        }
+    }
+}
+
 fn is_manganis_symbol(name: &str) -> bool {
     name.contains("__ASSETS__")
 }
@@ -505,7 +523,10 @@ fn find_wasm_symbol_offsets<'a, R: ReadRef<'a>>(
 
 /// Find all assets in the given file, hash them, and write them back to the file.
 /// Also extracts Android/Swift plugin metadata for FFI bindings.
-pub(crate) async fn extract_symbols_from_file(path: impl AsRef<Path>) -> Result<AppManifest> {
+pub(crate) async fn extract_symbols_from_file(
+    path: impl AsRef<Path>,
+    source_path_policy: BinarySourcePathPolicy,
+) -> Result<AppManifest> {
     let path = path.as_ref();
     let mut file =
         open_file_for_writing_with_timeout(path, OpenOptions::new().write(true).read(true)).await?;
@@ -615,6 +636,7 @@ pub(crate) async fn extract_symbols_from_file(path: impl AsRef<Path>) -> Result<
             .get(entry.asset_index)
             .copied()
             .expect("asset index collected from symbol scan");
+        let binary_asset = asset_for_binary(asset, source_path_policy);
 
         let new_data = match entry.representation {
             AssetRepresentation::RawBundled => {
@@ -623,11 +645,11 @@ pub(crate) async fn extract_symbols_from_file(path: impl AsRef<Path>) -> Result<
                     asset.absolute_source_path(),
                     asset.bundled_path()
                 );
-                serialize_bundled_asset(&asset)
+                serialize_bundled_asset(&binary_asset)
             }
             AssetRepresentation::SymbolData => {
                 tracing::debug!("Writing asset (SymbolData) to offset {offset}: {:?}", asset);
-                serialize_symbol_data(&SymbolData::Asset(asset))
+                serialize_symbol_data(&SymbolData::Asset(binary_asset))
             }
         };
         if new_data.len() > MANGANIS_SECTION_SIZE {
@@ -737,4 +759,41 @@ fn manganis_symbols<'a, 'b, R: ReadRef<'a>>(
         let section = file.section_by_index(section_index).ok()?;
         Some((symbol, section))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinarySourcePathPolicy, asset_for_binary};
+    use manganis::BundledAsset;
+    use manganis_core::AssetOptions;
+
+    fn test_asset() -> BundledAsset {
+        BundledAsset::new(
+            "/private/workspace/assets/logo.svg",
+            "/assets/logo-123.svg",
+            AssetOptions::builder()
+                .with_hash_suffix(false)
+                .into_asset_options(),
+        )
+    }
+
+    #[test]
+    fn preserving_source_paths_retains_the_complete_asset() {
+        let asset = test_asset();
+
+        assert_eq!(
+            asset_for_binary(asset, BinarySourcePathPolicy::Preserve),
+            asset
+        );
+    }
+
+    #[test]
+    fn redacting_source_paths_preserves_runtime_asset_metadata() {
+        let asset = test_asset();
+        let redacted = asset_for_binary(asset, BinarySourcePathPolicy::Redact);
+
+        assert_eq!(redacted.absolute_source_path(), "");
+        assert_eq!(redacted.bundled_path(), asset.bundled_path());
+        assert_eq!(redacted.options(), asset.options());
+    }
 }
