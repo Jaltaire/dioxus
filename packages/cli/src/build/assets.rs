@@ -29,6 +29,7 @@
 //! build system.
 
 use std::{
+    collections::HashSet,
     fs::OpenOptions,
     io::{Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -40,7 +41,7 @@ use crate::opt::AppManifest;
 use anyhow::{Context, bail};
 use const_serialize::{ConstVec, deserialize_const, serialize_const};
 use manganis::BundledAsset;
-use manganis_core::SymbolData;
+use manganis_core::{AssetOptions, SymbolData};
 use object::{File, Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef, Section, Symbol};
 use pdb::FallibleIterator;
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
@@ -50,6 +51,7 @@ use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 /// Matches `manganis::macro_helpers::serialize_asset`, which always pads to 4096 bytes so
 /// every entry is fixed-width and can be located by symbol offset alone.
 const MANGANIS_SECTION_SIZE: usize = 4096;
+const ABSOLUTE_SOURCE_PATH_FIELD: &[u8] = b"absolute_source_path";
 
 /// Deserialize a `__ASSETS__` payload.
 ///
@@ -165,6 +167,171 @@ enum AssetRepresentation {
     RawBundled,
     /// Serialized as SymbolData::Asset (new CBOR format)
     SymbolData,
+}
+
+fn serialize_asset_representation(
+    asset: BundledAsset,
+    representation: AssetRepresentation,
+) -> Vec<u8> {
+    match representation {
+        AssetRepresentation::RawBundled => serialize_bundled_asset(&asset),
+        AssetRepresentation::SymbolData => serialize_symbol_data(&SymbolData::Asset(asset)),
+    }
+}
+
+fn find_serialized_payload_offsets(file_contents: &[u8], payload: &[u8]) -> Vec<u64> {
+    if payload.is_empty() || payload.len() > file_contents.len() {
+        return Vec::new();
+    }
+
+    file_contents
+        .windows(payload.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == payload).then_some(offset as u64))
+        .collect()
+}
+
+fn deserialize_asset_representation(
+    payload: &[u8],
+    representation: AssetRepresentation,
+) -> Option<BundledAsset> {
+    match representation {
+        AssetRepresentation::RawBundled => {
+            let (remaining, asset) = deserialize_const!(BundledAsset, payload)?;
+            remaining.iter().all(|byte| *byte == 0).then_some(asset)
+        }
+        AssetRepresentation::SymbolData => {
+            let (remaining, symbol_data) = deserialize_const!(SymbolData, payload)?;
+            if !remaining.iter().all(|byte| *byte == 0) {
+                return None;
+            }
+            match symbol_data {
+                SymbolData::Asset(asset) => Some(asset),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn serialized_asset_source_prefix(
+    asset: BundledAsset,
+    representation: AssetRepresentation,
+) -> Option<Vec<u8>> {
+    let source_path = asset.absolute_source_path().as_bytes();
+    if source_path.is_empty() {
+        return None;
+    }
+    let payload = serialize_asset_representation(asset, representation);
+    let source_offset = payload
+        .windows(source_path.len())
+        .position(|candidate| candidate == source_path)?;
+    Some(payload[..source_offset + source_path.len()].to_vec())
+}
+
+fn serialized_asset_field_offset(representation: AssetRepresentation) -> usize {
+    let probe = BundledAsset::new(
+        "probe",
+        "probe",
+        AssetOptions::builder().into_asset_options(),
+    );
+    let payload = serialize_asset_representation(probe, representation);
+    payload
+        .windows(ABSOLUTE_SOURCE_PATH_FIELD.len())
+        .position(|candidate| candidate == ABSOLUTE_SOURCE_PATH_FIELD)
+        .expect("serialized assets contain the absolute source path field")
+}
+
+fn discover_serialized_assets(
+    file_contents: &[u8],
+    assets: &mut Vec<BundledAsset>,
+    write_entries: &mut Vec<AssetWriteEntry>,
+) {
+    let field_offsets = find_serialized_payload_offsets(file_contents, ABSOLUTE_SOURCE_PATH_FIELD);
+    let mut offsets = write_entries
+        .iter()
+        .map(|entry| entry.symbol.offset)
+        .collect::<HashSet<_>>();
+
+    for representation in [
+        AssetRepresentation::RawBundled,
+        AssetRepresentation::SymbolData,
+    ] {
+        let field_offset = serialized_asset_field_offset(representation) as u64;
+        for serialized_field_offset in field_offsets.iter().copied() {
+            let Some(offset) = serialized_field_offset.checked_sub(field_offset) else {
+                continue;
+            };
+            let Some(payload) = file_contents
+                .get(offset as usize..(offset as usize).saturating_add(MANGANIS_SECTION_SIZE))
+            else {
+                continue;
+            };
+            let Some(asset) = deserialize_asset_representation(payload, representation) else {
+                continue;
+            };
+            if asset.absolute_source_path().is_empty() || !offsets.insert(offset) {
+                continue;
+            }
+            let asset_index = match assets.iter().position(|candidate| candidate == &asset) {
+                Some(asset_index) => asset_index,
+                None => {
+                    let asset_index = assets.len();
+                    assets.push(asset);
+                    asset_index
+                }
+            };
+            write_entries.push(AssetWriteEntry::new(
+                ManganisSymbolOffset::new(offset),
+                asset_index,
+                representation,
+            ));
+        }
+    }
+}
+
+fn include_serialized_asset_copies(
+    file_contents: &[u8],
+    assets: &[BundledAsset],
+    write_entries: &mut Vec<AssetWriteEntry>,
+) {
+    let mut offsets = write_entries
+        .iter()
+        .map(|entry| entry.symbol.offset)
+        .collect::<HashSet<_>>();
+
+    for entry in write_entries.clone() {
+        let asset = assets
+            .get(entry.asset_index)
+            .copied()
+            .expect("asset index collected from symbol scan");
+        let Some(prefix) = serialized_asset_source_prefix(asset, entry.representation) else {
+            continue;
+        };
+
+        for offset in find_serialized_payload_offsets(file_contents, &prefix) {
+            let Some(payload) = file_contents
+                .get(offset as usize..(offset as usize).saturating_add(MANGANIS_SECTION_SIZE))
+            else {
+                continue;
+            };
+            let Some(candidate) = deserialize_asset_representation(payload, entry.representation)
+            else {
+                continue;
+            };
+            if candidate.absolute_source_path() != asset.absolute_source_path()
+                || candidate.options() != asset.options()
+            {
+                continue;
+            }
+            if offsets.insert(offset) {
+                write_entries.push(AssetWriteEntry::new(
+                    ManganisSymbolOffset::new(offset),
+                    entry.asset_index,
+                    entry.representation,
+                ));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -624,6 +791,9 @@ pub(crate) async fn extract_symbols_from_file(
         }
     }
 
+    discover_serialized_assets(&file_contents, &mut assets, &mut write_entries);
+    include_serialized_asset_copies(&file_contents, &assets, &mut write_entries);
+
     // Add the hash to each asset in parallel
     assets
         .par_iter_mut()
@@ -645,11 +815,11 @@ pub(crate) async fn extract_symbols_from_file(
                     asset.absolute_source_path(),
                     asset.bundled_path()
                 );
-                serialize_bundled_asset(&binary_asset)
+                serialize_asset_representation(binary_asset, entry.representation)
             }
             AssetRepresentation::SymbolData => {
                 tracing::debug!("Writing asset (SymbolData) to offset {offset}: {:?}", asset);
-                serialize_symbol_data(&SymbolData::Asset(binary_asset))
+                serialize_asset_representation(binary_asset, entry.representation)
             }
         };
         if new_data.len() > MANGANIS_SECTION_SIZE {
@@ -763,9 +933,14 @@ fn manganis_symbols<'a, 'b, R: ReadRef<'a>>(
 
 #[cfg(test)]
 mod tests {
-    use super::{BinarySourcePathPolicy, asset_for_binary};
+    use super::{
+        AssetRepresentation, AssetWriteEntry, BinarySourcePathPolicy, ManganisSymbolOffset,
+        asset_for_binary, deserialize_asset_representation, discover_serialized_assets,
+        find_serialized_payload_offsets, include_serialized_asset_copies,
+        serialize_asset_representation, serialize_symbol_data,
+    };
     use manganis::BundledAsset;
-    use manganis_core::AssetOptions;
+    use manganis_core::{AndroidArtifactMetadata, AssetOptions, SymbolData};
 
     fn test_asset() -> BundledAsset {
         BundledAsset::new(
@@ -795,5 +970,221 @@ mod tests {
         assert_eq!(redacted.absolute_source_path(), "");
         assert_eq!(redacted.bundled_path(), asset.bundled_path());
         assert_eq!(redacted.options(), asset.options());
+    }
+
+    #[test]
+    fn serialized_payload_search_handles_empty_and_oversized_payloads() {
+        assert!(find_serialized_payload_offsets(b"binary", b"").is_empty());
+        assert!(find_serialized_payload_offsets(b"binary", b"binary data").is_empty());
+    }
+
+    #[test]
+    fn serialized_payload_search_returns_every_exact_offset() {
+        assert_eq!(
+            find_serialized_payload_offsets(b"xpayloadypayloadz", b"payload"),
+            vec![1, 9]
+        );
+    }
+
+    #[test]
+    fn raw_serialized_asset_copies_are_added_once() {
+        let asset = test_asset();
+        let payload = serialize_asset_representation(asset, AssetRepresentation::RawBundled);
+        let stale_asset = BundledAsset::new(
+            asset.absolute_source_path(),
+            BundledAsset::PLACEHOLDER_HASH,
+            *asset.options(),
+        );
+        let stale_payload =
+            serialize_asset_representation(stale_asset, AssetRepresentation::RawBundled);
+        let mut binary = b"pre".to_vec();
+        binary.extend_from_slice(&payload);
+        binary.push(1);
+        binary.extend_from_slice(&stale_payload);
+        binary.extend_from_slice(b"post");
+        let second_offset = 4 + payload.len() as u64;
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(3),
+            0,
+            AssetRepresentation::RawBundled,
+        )];
+
+        include_serialized_asset_copies(&binary, &[asset], &mut entries);
+        include_serialized_asset_copies(&binary, &[asset], &mut entries);
+
+        let mut offsets = entries
+            .iter()
+            .map(|entry| entry.symbol.offset)
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(offsets, vec![3, second_offset]);
+    }
+
+    #[test]
+    fn wrapped_serialized_asset_copies_are_discovered() {
+        let asset = test_asset();
+        let stale_asset = BundledAsset::new(
+            asset.absolute_source_path(),
+            BundledAsset::PLACEHOLDER_HASH,
+            *asset.options(),
+        );
+        let payload = serialize_asset_representation(stale_asset, AssetRepresentation::SymbolData);
+        let mut binary = vec![0; 7];
+        binary.extend_from_slice(&payload);
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(9000),
+            0,
+            AssetRepresentation::SymbolData,
+        )];
+
+        include_serialized_asset_copies(&binary, &[asset], &mut entries);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].symbol.offset, 7);
+        assert!(matches!(
+            entries[1].representation,
+            AssetRepresentation::SymbolData
+        ));
+    }
+
+    #[test]
+    fn corrupted_serialized_asset_copies_are_ignored() {
+        let asset = test_asset();
+        let mut payload = serialize_asset_representation(asset, AssetRepresentation::RawBundled);
+        let last_index = payload.len() - 1;
+        payload[last_index] = 1;
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(9000),
+            0,
+            AssetRepresentation::RawBundled,
+        )];
+
+        include_serialized_asset_copies(&payload, &[asset], &mut entries);
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn serialized_asset_copies_with_different_options_are_ignored() {
+        let asset = test_asset();
+        let different_asset = BundledAsset::new(
+            asset.absolute_source_path(),
+            BundledAsset::PLACEHOLDER_HASH,
+            AssetOptions::builder()
+                .with_hash_suffix(true)
+                .into_asset_options(),
+        );
+        let payload =
+            serialize_asset_representation(different_asset, AssetRepresentation::RawBundled);
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(9000),
+            0,
+            AssetRepresentation::RawBundled,
+        )];
+
+        include_serialized_asset_copies(&payload, &[asset], &mut entries);
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn redacted_assets_do_not_trigger_serialized_copy_scans() {
+        let original = test_asset();
+        let asset = BundledAsset::new("", original.bundled_path(), *original.options());
+        let payload = serialize_asset_representation(asset, AssetRepresentation::RawBundled);
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(9000),
+            0,
+            AssetRepresentation::RawBundled,
+        )];
+
+        include_serialized_asset_copies(&payload, &[asset], &mut entries);
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn serialized_asset_discovery_recovers_raw_and_wrapped_assets() {
+        let asset = test_asset();
+        let raw = serialize_asset_representation(asset, AssetRepresentation::RawBundled);
+        let wrapped = serialize_asset_representation(asset, AssetRepresentation::SymbolData);
+        let mut binary = b"prefix".to_vec();
+        binary.extend_from_slice(&raw);
+        binary.push(1);
+        binary.extend_from_slice(&wrapped);
+        let mut assets = Vec::new();
+        let mut entries = Vec::new();
+
+        discover_serialized_assets(&binary, &mut assets, &mut entries);
+
+        assert_eq!(assets, vec![asset]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].symbol.offset, 6);
+        assert_eq!(entries[1].symbol.offset, 7 + raw.len() as u64);
+        assert!(matches!(
+            entries[0].representation,
+            AssetRepresentation::RawBundled
+        ));
+        assert!(matches!(
+            entries[1].representation,
+            AssetRepresentation::SymbolData
+        ));
+    }
+
+    #[test]
+    fn serialized_asset_discovery_deduplicates_known_offsets_and_assets() {
+        let asset = test_asset();
+        let raw = serialize_asset_representation(asset, AssetRepresentation::RawBundled);
+        let wrapped = serialize_asset_representation(asset, AssetRepresentation::SymbolData);
+        let mut binary = raw;
+        binary.extend_from_slice(&wrapped);
+        let mut assets = vec![asset];
+        let mut entries = vec![AssetWriteEntry::new(
+            ManganisSymbolOffset::new(0),
+            0,
+            AssetRepresentation::RawBundled,
+        )];
+
+        discover_serialized_assets(&binary, &mut assets, &mut entries);
+
+        assert_eq!(assets, vec![asset]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].asset_index, 0);
+        assert_eq!(entries[1].symbol.offset, 4096);
+    }
+
+    #[test]
+    fn serialized_asset_discovery_ignores_redacted_corrupt_and_partial_payloads() {
+        let original = test_asset();
+        let redacted = BundledAsset::new("", original.bundled_path(), *original.options());
+        let mut corrupt = serialize_asset_representation(original, AssetRepresentation::RawBundled);
+        let last_index = corrupt.len() - 1;
+        corrupt[last_index] = 1;
+        let complete = serialize_asset_representation(original, AssetRepresentation::RawBundled);
+        let partial = &complete[..128];
+        let mut binary = b"absolute_source_path".to_vec();
+        binary.extend_from_slice(&serialize_asset_representation(
+            redacted,
+            AssetRepresentation::RawBundled,
+        ));
+        binary.extend_from_slice(&corrupt);
+        binary.extend_from_slice(partial);
+        let mut assets = Vec::new();
+        let mut entries = Vec::new();
+
+        discover_serialized_assets(&binary, &mut assets, &mut entries);
+
+        assert!(assets.is_empty());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn wrapped_non_asset_metadata_is_not_treated_as_an_asset() {
+        let metadata = AndroidArtifactMetadata::new("plugin", "/artifact.aar", "dependency");
+        let payload = serialize_symbol_data(&SymbolData::AndroidArtifact(metadata));
+
+        assert!(
+            deserialize_asset_representation(&payload, AssetRepresentation::SymbolData).is_none()
+        );
     }
 }
