@@ -1367,7 +1367,7 @@ impl BuildRequest {
             // for now, we don't do anything with dlls, and only use .dylibs and .so files
 
             // Write dylibs and dlls to the frameworks folder
-            if arg.ends_with(".dylib") | arg.ends_with(".so") {
+            if is_dynamic_library_path(arg) {
                 let from = PathBuf::from(arg);
                 let to = framework_dir.join(from.file_name().unwrap());
                 _ = std::fs::remove_file(&to);
@@ -3166,5 +3166,34 @@ impl BuildRequest {
         }
 
         deps
+    }
+}
+
+fn is_dynamic_library_path(argument: &str) -> bool {
+    !argument.starts_with('-') && (argument.ends_with(".dylib") || argument.ends_with(".so"))
+}
+
+#[cfg(test)]
+mod dynamic_library_path_tests {
+    use super::is_dynamic_library_path;
+
+    #[test]
+    fn accepts_dynamic_library_paths() {
+        assert!(is_dynamic_library_path("/opt/lib/libexample.dylib"));
+        assert!(is_dynamic_library_path("relative/libexample.so"));
+    }
+
+    #[test]
+    fn rejects_linker_options_ending_in_dynamic_library_suffixes() {
+        assert!(!is_dynamic_library_path("-Wl,-soname,libmain.so"));
+        assert!(!is_dynamic_library_path(
+            "-Zllvm-plugins=/opt/lib/Obfuscator.dylib"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_dynamic_library_paths() {
+        assert!(!is_dynamic_library_path("/opt/lib/libexample.a"));
+        assert!(!is_dynamic_library_path("libexample"));
     }
 }
