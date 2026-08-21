@@ -1,7 +1,7 @@
 use std::{fs::create_dir_all, path::PathBuf};
 
 use crate::opt::process_file_to;
-use crate::{Result, StructuredOutput};
+use crate::{BinarySourcePathPolicy, Result, StructuredOutput};
 use clap::Parser;
 use tracing::debug;
 
@@ -16,7 +16,9 @@ pub struct BuildAssets {
 
 impl BuildAssets {
     pub async fn run(self) -> Result<StructuredOutput> {
-        let manifest = crate::extract_symbols_from_file(&self.executable).await?;
+        let manifest =
+            crate::extract_symbols_from_file(&self.executable, BinarySourcePathPolicy::Preserve)
+                .await?;
 
         create_dir_all(&self.destination)?;
 
