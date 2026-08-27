@@ -27,6 +27,9 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
         match window_event {
             Event::NewEvents(StartCause::Init) => app.handle_start_cause_init(),
             Event::LoopDestroyed => app.handle_loop_destroyed(),
+            Event::Opened { urls } => {
+                crate::opened_urls::remember(urls.into_iter().map(|url| url.to_string()))
+            }
             Event::WindowEvent {
                 event, window_id, ..
             } => match event {

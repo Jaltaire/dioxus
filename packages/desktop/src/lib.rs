@@ -21,6 +21,7 @@ mod hooks;
 mod ipc;
 mod menubar;
 mod mobile;
+mod opened_urls;
 mod protocol;
 mod query;
 mod shortcut;
@@ -33,6 +34,7 @@ mod mobile_shortcut;
 
 /// The main entrypoint for this crate
 pub mod launch;
+pub use opened_urls::take_opened_urls;
 
 // Reexport tao and wry, might want to re-export other important things
 pub use tao;
