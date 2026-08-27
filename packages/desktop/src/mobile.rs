@@ -1,3 +1,34 @@
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug)]
+struct StartupBarrier {
+    ready: std::sync::Mutex<bool>,
+    condition: std::sync::Condvar,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl StartupBarrier {
+    const fn new() -> Self {
+        Self {
+            ready: std::sync::Mutex::new(false),
+            condition: std::sync::Condvar::new(),
+        }
+    }
+
+    fn mark_ready(&self) {
+        let mut ready = self.ready.lock().unwrap();
+        *ready = true;
+        self.condition.notify_all();
+    }
+
+    fn wait(&self) {
+        let ready = self.ready.lock().unwrap();
+        drop(self.condition.wait_while(ready, |ready| !*ready).unwrap());
+    }
+}
+
+#[cfg(target_os = "android")]
+static ANDROID_CONTEXT_READY: StartupBarrier = StartupBarrier::new();
+
 /// Expose the `Java_dev_dioxus_main_Rust_*` JNI trampolines that wry's Kotlin layer calls into.
 /// We hardcode the package to `dev.dioxus.main` so host Java/Kotlin always has a single set of
 /// symbols to bind against, without having to plumb the top-level package name down into this crate.
@@ -46,6 +77,7 @@ pub extern "C" fn start_app() {
                 );
             }
         });
+        ANDROID_CONTEXT_READY.mark_ready();
         unsafe {
             wry::android_setup(package, env, looper, activity);
         }
@@ -67,6 +99,7 @@ pub extern "C" fn start_app() {
         }
 
         stop_unwind(|| unsafe {
+            ANDROID_CONTEXT_READY.wait();
             let mut main_fn_ptr = libc::dlsym(libc::RTLD_DEFAULT, b"main\0".as_ptr() as _);
 
             if main_fn_ptr.is_null() {
@@ -97,5 +130,38 @@ pub extern "C" fn start_app() {
             let main_fn: extern "C" fn() = std::mem::transmute(main_fn_ptr);
             main_fn();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::StartupBarrier;
+
+    #[test]
+    fn startup_waits_for_platform_context_and_remains_ready() {
+        let barrier = Arc::new(StartupBarrier::new());
+        let waiter_barrier = barrier.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiter_barrier.wait();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(25)).is_err());
+        barrier.mark_ready();
+        receive.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+        barrier.wait();
+    }
+
+    #[test]
+    fn marking_platform_context_ready_is_idempotent() {
+        let barrier = StartupBarrier::new();
+        barrier.mark_ready();
+        barrier.mark_ready();
+        barrier.wait();
     }
 }
