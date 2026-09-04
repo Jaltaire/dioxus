@@ -396,6 +396,34 @@ impl Default for Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stores_every_background_throttling_policy() {
+        assert!(Config::new().background_throttling.is_none());
+        assert!(matches!(
+            Config::new()
+                .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+                .background_throttling,
+            Some(BackgroundThrottlingPolicy::Disabled)
+        ));
+        assert!(matches!(
+            Config::new()
+                .with_background_throttling(BackgroundThrottlingPolicy::Suspend)
+                .background_throttling,
+            Some(BackgroundThrottlingPolicy::Suspend)
+        ));
+        assert!(matches!(
+            Config::new()
+                .with_background_throttling(BackgroundThrottlingPolicy::Throttle)
+                .background_throttling,
+            Some(BackgroundThrottlingPolicy::Throttle)
+        ));
+    }
+}
+
 // dirty trick, avoid introducing `image` at runtime
 // TODO: use serde when `Icon` impl serde
 //
