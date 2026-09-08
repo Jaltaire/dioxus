@@ -79,10 +79,9 @@ pub struct DesktopService {
     ///
     /// Kept because a page can be replaced underneath a running application --
     /// the platform terminates the process drawing it and it is loaded again --
-    /// and the components that put these there will not do so a second time.
-    /// Their hooks have already run, and re-running the virtual dom does not
-    /// reset those, so without this record the new page has an empty head and
-    /// the application is rendered into a document with no styling.
+    /// and the replacement must receive these elements before remounted effects
+    /// run. Without this record, the new page can initially have an empty head
+    /// and render without styling.
     pub(crate) head_elements: Rc<RefCell<Vec<String>>>,
 
     #[cfg(target_os = "ios")]
@@ -197,11 +196,14 @@ impl DesktopService {
     /// Called once a page that replaced another is ready. On a page that
     /// replaced nothing there is nothing remembered yet, so this does nothing.
     pub(crate) fn replay_head_elements(&self) {
-        let scripts = self.head_elements.borrow().clone();
+        let scripts = std::mem::take(&mut *self.head_elements.borrow_mut());
         if scripts.is_empty() {
             return;
         }
-        tracing::debug!("Putting {} head elements back into the new page.", scripts.len());
+        tracing::debug!(
+            "Putting {} head elements back into the new page.",
+            scripts.len()
+        );
         for js in scripts {
             self.webview.evaluate_script(&js).ok();
         }

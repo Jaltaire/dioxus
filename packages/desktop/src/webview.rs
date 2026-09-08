@@ -195,11 +195,19 @@ impl WebviewEdits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RendererState {
+    #[default]
+    Initial,
+    Replaced,
+}
+
 pub(crate) struct WebviewInstance {
     pub dom: VirtualDom,
     pub edits: WebviewEdits,
     pub desktop_context: DesktopContext,
     pub waker: Waker,
+    pub renderer_state: RendererState,
 
     // Wry assumes the webcontext is alive for the lifetime of the webview.
     // We need to keep the webcontext alive, otherwise the webview will crash
@@ -372,28 +380,29 @@ impl WebviewInstance {
             .with_navigation_handler({
                 let page_loaded = page_loaded.clone();
                 move |var: String| {
-                // Serve the index and assets.
-                if var.starts_with("dioxus://")
-                    || var.starts_with("http://dioxus.")
-                    || var.starts_with("https://dioxus.")
-                {
-                    // After the page has loaded once, don't allow any more navigation
-                    let page_loaded = page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
-                    return !page_loaded;
-                }
+                    // Serve the index and assets.
+                    if var.starts_with("dioxus://")
+                        || var.starts_with("http://dioxus.")
+                        || var.starts_with("https://dioxus.")
+                    {
+                        // After the page has loaded once, don't allow any more navigation
+                        let page_loaded =
+                            page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
+                        return !page_loaded;
+                    }
 
-                // External links always open somewhere else. Prevents the webview from navigating
-                if var.starts_with("http://")
-                    || var.starts_with("https://")
-                    || var.starts_with("mailto:")
-                {
-                    _ = webbrowser::open(&var);
-                    return false;
-                }
+                    // External links always open somewhere else. Prevents the webview from navigating
+                    if var.starts_with("http://")
+                        || var.starts_with("https://")
+                        || var.starts_with("mailto:")
+                    {
+                        _ = webbrowser::open(&var);
+                        return false;
+                    }
 
-                // By default, external links are allowed. This keeps things like iframes working.
-                // However, users can customize this to allow/disallow domains/routes/patterns.
-                navigation_handler.as_ref().map(|f| f(&var)).unwrap_or(true)
+                    // By default, external links are allowed. This keeps things like iframes working.
+                    // However, users can customize this to allow/disallow domains/routes/patterns.
+                    navigation_handler.as_ref().map(|f| f(&var)).unwrap_or(true)
                 }
             })
             .with_asynchronous_custom_protocol(String::from("dioxus"), request_handler);
@@ -567,6 +576,7 @@ impl WebviewInstance {
             edits,
             waker: tao_waker(shared.proxy.clone(), desktop_context.window.id()),
             desktop_context,
+            renderer_state: RendererState::Initial,
             _menu: menu,
             _web_context: web_context,
         }

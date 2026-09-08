@@ -61,9 +61,7 @@ impl WryQueue {
     /// nothing is reading and the window stays empty.
     pub(crate) fn forget_connection(&self) {
         let mut inner = self.inner.borrow_mut();
-        inner
-            .websocket
-            .forget_connection(inner.location.webview_id);
+        inner.websocket.forget_connection(inner.location.webview_id);
         // The page owed an acknowledgement for the last edits it was sent, and
         // cannot give one now. Left in place it is waited on for good: the
         // virtual dom is held back until the edits in flight are flushed, so

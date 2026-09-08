@@ -5,7 +5,7 @@ use crate::{
     ipc::{IpcMessage, UserWindowEvent},
     query::QueryResult,
     shortcut::ShortcutRegistry,
-    webview::{PendingWebview, WebviewInstance},
+    webview::{PendingWebview, RendererState, WebviewInstance},
 };
 use dioxus_core::VirtualDom;
 use std::{
@@ -295,7 +295,7 @@ impl App {
     ///
     /// iOS does this to an application that has been in the background a while.
     pub fn reload_after_web_content_process_terminated(&mut self, id: WindowId) {
-        let Some(view) = self.webviews.get(&id) else {
+        let Some(view) = self.webviews.get_mut(&id) else {
             return;
         };
 
@@ -303,8 +303,13 @@ impl App {
         // would go to a channel nothing is reading. Forgetting it first means
         // the edits that rebuild the new page are queued for it instead.
         view.edits.wry_queue.forget_connection();
+        view.renderer_state = RendererState::Replaced;
 
-        if let Err(error) = view.desktop_context.webview.load_url("dioxus://index.html/") {
+        if let Err(error) = view
+            .desktop_context
+            .webview
+            .load_url("dioxus://index.html/")
+        {
             tracing::error!(
                 "The page could not be loaded again after its web content process was \
                  terminated, so the window will stay empty: {error}"
@@ -317,19 +322,22 @@ impl App {
     /// Let's rebuild it and then start polling it
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
         let view = self.webviews.get_mut(&id).unwrap();
+        let renderer_state = std::mem::take(&mut view.renderer_state);
 
         view.edits
             .wry_queue
-            .with_mutation_state_mut(|f| view.dom.rebuild(f));
+            .with_mutation_state_mut(|f| match renderer_state {
+                RendererState::Initial => view.dom.rebuild(f),
+                RendererState::Replaced => view.dom.rebuild_after_renderer_loss(f),
+            });
 
         view.edits.wry_queue.send_edits();
 
         // Anything the document put into the head belongs to the page that had
         // it, and a page that has replaced another starts with an empty one.
-        // The components that put them there will not do it again -- their
-        // hooks have already run, and re-running the virtual dom does not reset
-        // those -- so they are put back from what the window remembers. On a
-        // first load nothing is remembered yet and this does nothing.
+        // The remembered elements are restored immediately while the remounted
+        // component tree prepares its effects. On a first load there are no
+        // remembered elements, so this does nothing.
         view.desktop_context.replay_head_elements();
 
         #[cfg(not(target_os = "linux"))]

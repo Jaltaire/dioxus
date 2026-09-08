@@ -11,6 +11,74 @@ use std::sync::{Arc, Mutex};
 
 type Shared<T> = Arc<Mutex<T>>;
 
+#[derive(Clone, Default)]
+struct RendererLossTracker {
+    created: Arc<std::sync::atomic::AtomicUsize>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct RendererLossLease(RendererLossTracker);
+
+impl RendererLossLease {
+    fn new(tracker: RendererLossTracker) -> Self {
+        tracker
+            .created
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracker
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(tracker)
+    }
+}
+
+impl Drop for RendererLossLease {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn renderer_loss_app() -> Element {
+    let tracker = consume_context::<RendererLossTracker>();
+    let _lease = use_hook(|| Rc::new(RendererLossLease::new(tracker)));
+    rsx! { div { "Recovered" } }
+}
+
+#[test]
+fn renderer_loss_replaces_the_mounted_component_tree() {
+    let tracker = RendererLossTracker::default();
+    let mut dom = VirtualDom::new(renderer_loss_app).with_root_context(tracker.clone());
+    dom.rebuild(&mut dioxus_core::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    dom.rebuild_after_renderer_loss(&mut dioxus_core::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    dom.rebuild_after_renderer_loss(&mut dioxus_core::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    drop(dom);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn renderer_loss_can_build_an_unmounted_dom() {
+    let tracker = RendererLossTracker::default();
+    let mut dom = VirtualDom::new(renderer_loss_app).with_root_context(tracker.clone());
+
+    dom.rebuild_after_renderer_loss(&mut dioxus_core::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[test]
 fn manual_diffing() {
     #[derive(Clone)]

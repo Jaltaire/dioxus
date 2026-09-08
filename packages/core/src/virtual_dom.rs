@@ -593,6 +593,14 @@ impl VirtualDom {
         to.append_children(ElementId(0), m);
     }
 
+    #[allow(missing_docs)]
+    pub fn rebuild_after_renderer_loss(&mut self, to: &mut impl WriteMutations) {
+        if let Some(previous) = self.scopes[ScopeId::ROOT.0].last_rendered_node.take() {
+            previous.remove_node_inner::<NoOpMutations>(self, None, true, None);
+        }
+        self.rebuild(to);
+    }
+
     /// Render whatever the VirtualDom has ready as fast as possible without requiring an executor to progress
     /// suspended subtrees.
     #[instrument(skip(self, to), level = "trace", name = "VirtualDom::render_immediate")]
