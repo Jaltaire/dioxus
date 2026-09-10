@@ -194,7 +194,7 @@ impl TouchPoint {
     }
 
     /// A unique identifier for this touch point that will be the same for the duration of the touch
-    fn identifier(&self) -> i32 {
+    pub fn identifier(&self) -> i32 {
         self.inner.identifier()
     }
 
