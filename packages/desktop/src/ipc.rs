@@ -20,10 +20,10 @@ pub enum UserWindowEvent {
     /// Poll the virtualdom
     Poll(WindowId),
 
-    /// The process drawing this window's page has been terminated by the
-    /// platform, so the page it was showing no longer exists and has to be
-    /// loaded again.
-    WebContentProcessTerminated(WindowId),
+    /// This window's page is lost - the process drawing it was terminated
+    /// by the platform, or the page is on screen showing nothing of what the
+    /// virtual dom holds - and has to be loaded again.
+    PageLost(WindowId),
 
     /// Handle an ipc message eminating from the window.postMessage of a given webview
     Ipc {

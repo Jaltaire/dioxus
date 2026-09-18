@@ -294,8 +294,8 @@ impl App {
     /// into it from the virtual dom that never went anywhere.
     ///
     /// iOS does this to an application that has been in the background a while.
-    pub fn reload_after_web_content_process_terminated(&mut self, id: WindowId) {
-        let Some(view) = self.webviews.get_mut(&id) else {
+    pub fn reload_lost_page(&mut self, id: WindowId) {
+        let Some(view) = self.webviews.get(&id) else {
             return;
         };
 
