@@ -423,7 +423,7 @@ impl WebviewInstance {
                 // Cleared before the reload is asked for, because the guard
                 // would refuse the very navigation being asked for.
                 page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
-                _ = proxy.send_event(UserWindowEvent::WebContentProcessTerminated(window_id));
+                _ = proxy.send_event(UserWindowEvent::PageLost(window_id));
             });
         };
 
@@ -543,6 +543,7 @@ impl WebviewInstance {
             asset_handlers,
             file_hover,
             cfg.window_close_behavior,
+            page_loaded,
         ));
 
         // Provide the desktop context to the virtual dom and edit handler

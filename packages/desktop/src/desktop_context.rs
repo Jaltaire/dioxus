@@ -75,6 +75,12 @@ pub struct DesktopService {
     pub(crate) file_hover: NativeFileHover,
     pub(crate) close_behaviour: Rc<Cell<WindowCloseBehaviour>>,
 
+    /// Whether the window's page has been loaded once. The navigation guard
+    /// refuses every load of the page after the first, so that a link in the
+    /// page cannot navigate the window away; a page that is lost is loaded
+    /// again by clearing this first.
+    pub(crate) page_loaded: Arc<std::sync::atomic::AtomicBool>,
+
     /// The head elements this window's document has put into its page.
     ///
     /// Kept because a page can be replaced underneath a running application --
@@ -106,6 +112,7 @@ impl DesktopService {
         asset_handlers: AssetHandlerRegistry,
         file_hover: NativeFileHover,
         close_behaviour: WindowCloseBehaviour,
+        page_loaded: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             window,
@@ -114,11 +121,31 @@ impl DesktopService {
             asset_handlers,
             file_hover,
             close_behaviour: Rc::new(Cell::new(close_behaviour)),
+            page_loaded,
             head_elements: Rc::new(RefCell::new(Vec::new())),
             query: Default::default(),
             #[cfg(target_os = "ios")]
             views: Default::default(),
         }
+    }
+
+    /// Loads the window's page again, from the virtual dom that never went
+    /// anywhere.
+    ///
+    /// For a page the application has found lost: on screen but showing
+    /// nothing of what the virtual dom holds, and not answering. The platform
+    /// reclaims a page's process from an application in the background and
+    /// says so, and that case is handled without being asked; this is for the
+    /// cases it does not say so, which an application notices by asking the
+    /// page a question and getting no answer. The page is loaded once more,
+    /// the virtual dom is rebuilt into it, and the head is put back.
+    pub fn reload_lost_page(&self) {
+        self.page_loaded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        _ = self
+            .shared
+            .proxy
+            .send_event(UserWindowEvent::PageLost(self.window.id()));
     }
 
     /// Start the creation of a new window using the props and window builder
