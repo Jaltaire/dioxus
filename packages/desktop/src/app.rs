@@ -322,28 +322,44 @@ impl App {
     /// it has not, the load is asked for again, up to a limit past which the
     /// window is given up as lost rather than reloaded forever.
     pub fn reload_lost_page(&mut self, id: WindowId) {
-        let Some(view) = self.webviews.get(&id) else {
-            return;
-        };
+        self.load_lost_page(id, 1);
+    }
 
-        let attempt = self.pending_reloads.entry(id).or_insert(0);
-        *attempt += 1;
-        let attempt = *attempt;
-        if attempt > PAGE_RELOAD_ATTEMPTS {
+    /// The time an attempt to load a lost page again was given is up. If
+    /// that attempt is still the one being waited on, the page never reported
+    /// in, and it is loaded again; if the page has since reported in, a later
+    /// attempt has replaced this one, or the platform has reported the page
+    /// lost afresh, there is nothing to do.
+    pub fn page_reload_due(&mut self, id: WindowId, attempt: u32) {
+        if self.pending_reloads.get(&id) != Some(&attempt) {
+            return;
+        }
+        if attempt >= PAGE_RELOAD_ATTEMPTS {
             self.pending_reloads.remove(&id);
             tracing::error!(
-                "The page was asked for {PAGE_RELOAD_ATTEMPTS} times after its web content \
+                "The page was loaded {PAGE_RELOAD_ATTEMPTS} times after its web content \
                  process was terminated and never reported in, so the window is left as it is."
             );
             return;
         }
-        if attempt > 1 {
-            tracing::warn!(
-                "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
-                 again, so it is being loaded once more (attempt {attempt} of \
-                 {PAGE_RELOAD_ATTEMPTS})."
-            );
-        }
+        tracing::warn!(
+            "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
+             again, so it is being loaded once more (attempt {} of {PAGE_RELOAD_ATTEMPTS}).",
+            attempt + 1
+        );
+        self.load_lost_page(id, attempt + 1);
+    }
+
+    /// Loads a lost page again and starts the clock on its reporting in.
+    ///
+    /// A loss reported by the platform is attempt one, whatever came before
+    /// it: a page lost afresh is a new loss, not a failed attempt at the last
+    /// one. Only the attempts this clock asks for count toward the limit.
+    fn load_lost_page(&mut self, id: WindowId, attempt: u32) {
+        let Some(view) = self.webviews.get(&id) else {
+            return;
+        };
+        self.pending_reloads.insert(id, attempt);
 
         // The navigation guard lets the page load exactly once after the flag
         // is cleared, and the attempt before this one used that up.
@@ -372,17 +388,6 @@ impl App {
             std::thread::sleep(PAGE_RELOAD_PATIENCE);
             _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, attempt });
         });
-    }
-
-    /// The time an attempt to load a lost page again was given is up. If
-    /// that attempt is still the one being waited on, the page never reported
-    /// in, and it is loaded again; if the page has since reported in, or a
-    /// later attempt has replaced this one, there is nothing to do.
-    pub fn page_reload_due(&mut self, id: WindowId, attempt: u32) {
-        if self.pending_reloads.get(&id) != Some(&attempt) {
-            return;
-        }
-        self.reload_lost_page(id);
     }
 
     /// The webview is finally loaded
