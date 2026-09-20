@@ -61,6 +61,10 @@ impl WryQueue {
     /// nothing is reading and the window stays empty.
     pub(crate) fn forget_connection(&self) {
         let mut inner = self.inner.borrow_mut();
+        tracing::info!(
+            "Webview {} forgets its edits connection.",
+            inner.location.webview_id
+        );
         inner.websocket.forget_connection(inner.location.webview_id);
         // The page owed an acknowledgement for the last edits it was sent, and
         // cannot give one now. Left in place it is waited on for good: the
@@ -79,6 +83,10 @@ impl WryQueue {
         let mut myself = self.inner.borrow_mut();
         let webview_id = myself.location.webview_id;
         let serialized_edits = myself.mutation_state.export_memory();
+        tracing::info!(
+            "Webview {webview_id} is sent {} bytes of edits.",
+            serialized_edits.len()
+        );
         let receiver = myself.websocket.send_edits(webview_id, serialized_edits);
         myself.edits_in_progress = Some(receiver);
     }
@@ -351,6 +359,11 @@ impl EditWebsocket {
                 let data = msg.edits.clone();
                 queued_message = Some(msg);
                 // Send the edits to the webview
+                tracing::info!(
+                    "Edits connection {connection_number} of webview {} sends {} bytes.",
+                    location.webview_id,
+                    data.len()
+                );
                 if let Err(e) = websocket.send(tungstenite::Message::Binary(data.into())) {
                     tracing::error!("Error sending edits to webview: {}", e);
                     break 'connection;
@@ -372,6 +385,10 @@ impl EditWebsocket {
                 }
 
                 let msg = queued_message.take().expect("Message should be set here");
+                tracing::info!(
+                    "Edits connection {connection_number} of webview {} has its edits applied.",
+                    location.webview_id
+                );
 
                 // Notify that the edits have been applied
                 if msg.response.send(()).is_err() {
@@ -393,6 +410,11 @@ impl EditWebsocket {
                 connections.get(&location.webview_id),
                 Some(WebviewConnectionState::Connected { connection, .. }) if *connection == connection_number
             );
+            tracing::info!(
+                "Edits connection {connection_number} of webview {} ended; the table {} refers to it.",
+                location.webview_id,
+                if still_mine { "still" } else { "no longer" }
+            );
             if still_mine {
                 let mut connection = WebviewConnectionState::default();
                 if let Some(msg) = queued_message {
@@ -406,6 +428,11 @@ impl EditWebsocket {
         match connections.remove(&location.webview_id) {
             // If there are pending edits, send them to the new connection
             Some(WebviewConnectionState::Pending { mut pending }) => {
+                tracing::info!(
+                    "Webview {} opened edits connection {connection_number}; {} batches were waiting.",
+                    location.webview_id,
+                    pending.len()
+                );
                 while let Some(pair) = pending.pop_front() {
                     _ = edits_outgoing.send(pair);
                 }
@@ -421,13 +448,18 @@ impl EditWebsocket {
             // that no longer exists. The new one is rebuilt from the virtual dom
             // when it reports in, which is the whole of what it needs.
             Some(WebviewConnectionState::Connected { .. }) => {
-                tracing::debug!(
-                    "Webview {} connected again, so the connection before it is dropped.",
+                tracing::info!(
+                    "Webview {} opened edits connection {connection_number} over one still open, which is dropped.",
                     location.webview_id
                 );
             }
 
-            None => {}
+            None => {
+                tracing::info!(
+                    "Webview {} opened edits connection {connection_number}, its first.",
+                    location.webview_id
+                );
+            }
         }
 
         connections.insert(
