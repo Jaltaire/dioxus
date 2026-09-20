@@ -399,10 +399,7 @@ impl App {
 
         view.edits
             .wry_queue
-            .with_mutation_state_mut(|f| match renderer_state {
-                RendererState::Initial => view.dom.rebuild(f),
-                RendererState::Replaced => view.dom.rebuild_after_renderer_loss(f),
-            });
+            .with_mutation_state_mut(|f| view.dom.rebuild_into_a_new_page(f));
 
         view.edits.wry_queue.send_edits();
 
