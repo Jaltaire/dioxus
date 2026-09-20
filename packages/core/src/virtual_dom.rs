@@ -593,6 +593,35 @@ impl VirtualDom {
         to.append_children(ElementId(0), m);
     }
 
+    /// Performs a *full* rebuild into a page that has replaced the one the dom was rendered into.
+    ///
+    /// The page the dom was rendered into is gone -- the platform took the process drawing it --
+    /// and a new, empty one stands in its place. What was rendered into the old page is
+    /// forgotten first: every scope below the root is dropped and every task those scopes
+    /// spawned is cancelled, without a single mutation, since there is no page left for a
+    /// mutation to reach. Then the dom is rebuilt into the new page as [`VirtualDom::rebuild`]
+    /// would build it into a first one.
+    ///
+    /// Rebuilding without forgetting leaves the old scopes alive but unreachable, so a task
+    /// they spawned -- a timer, a player, a poll -- runs on beside its replacement for as
+    /// long as the application does.
+    ///
+    /// On a dom that has never been rendered this is exactly [`VirtualDom::rebuild`].
+    #[instrument(
+        skip(self, to),
+        level = "trace",
+        name = "VirtualDom::rebuild_into_a_new_page"
+    )]
+    pub fn rebuild_into_a_new_page(&mut self, to: &mut impl WriteMutations) {
+        {
+            let _runtime = RuntimeGuard::new(self.runtime.clone());
+            if let Some(rendered) = self.scopes[ScopeId::ROOT.0].last_rendered_node.take() {
+                rendered.remove_node_inner::<NoOpMutations>(self, None, true, None);
+            }
+        }
+        self.rebuild(to);
+    }
+
     /// Render whatever the VirtualDom has ready as fast as possible without requiring an executor to progress
     /// suspended subtrees.
     #[instrument(skip(self, to), level = "trace", name = "VirtualDom::render_immediate")]

@@ -397,7 +397,7 @@ impl App {
 
         view.edits
             .wry_queue
-            .with_mutation_state_mut(|f| view.dom.rebuild(f));
+            .with_mutation_state_mut(|f| view.dom.rebuild_into_a_new_page(f));
 
         view.edits.wry_queue.send_edits();
 
