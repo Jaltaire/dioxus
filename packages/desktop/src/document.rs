@@ -55,7 +55,8 @@ impl Document for DesktopDocument {
     fn create_script(&self, props: ScriptProps) {
         let myself = self.clone();
         queue_effect(move || {
-            let js = create_element_in_head("script", &props.attributes(), props.script_contents().ok());
+            let js =
+                create_element_in_head("script", &props.attributes(), props.script_contents().ok());
             if let Some(ctx) = myself.desktop_ctx.upgrade() {
                 ctx.remember_head_element(js.clone());
             }
@@ -67,7 +68,8 @@ impl Document for DesktopDocument {
     fn create_style(&self, props: StyleProps) {
         let myself = self.clone();
         queue_effect(move || {
-            let js = create_element_in_head("style", &props.attributes(), props.style_contents().ok());
+            let js =
+                create_element_in_head("style", &props.attributes(), props.style_contents().ok());
             if let Some(ctx) = myself.desktop_ctx.upgrade() {
                 ctx.remember_head_element(js.clone());
             }

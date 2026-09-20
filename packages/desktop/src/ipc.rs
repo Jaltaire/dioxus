@@ -25,6 +25,13 @@ pub enum UserWindowEvent {
     /// virtual dom holds - and has to be loaded again.
     PageLost(WindowId),
 
+    /// The time a lost page was given to load again is up. If the page has
+    /// still not reported in, this attempt failed, and another is made.
+    PageReloadDue {
+        id: WindowId,
+        attempt: u32,
+    },
+
     /// Handle an ipc message eminating from the window.postMessage of a given webview
     Ipc {
         id: WindowId,

@@ -228,7 +228,10 @@ impl DesktopService {
         if scripts.is_empty() {
             return;
         }
-        tracing::debug!("Putting {} head elements back into the new page.", scripts.len());
+        tracing::debug!(
+            "Putting {} head elements back into the new page.",
+            scripts.len()
+        );
         for js in scripts {
             self.webview.evaluate_script(&js).ok();
         }
