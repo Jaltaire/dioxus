@@ -43,10 +43,13 @@ pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
 
 /// How many times a load that has begun is given another period of patience
 /// to commit before it is taken to have stalled and asked for again. A load
-/// that has begun is on its way in almost every case, and asking again while
-/// it is on its way starts a second load racing the first; but a load can
-/// also begin and never commit, so the waiting is not for ever.
-pub(crate) const PAGE_LOAD_BEGUN_WAITS: u32 = 3;
+/// that has begun usually commits within a moment of its process being up,
+/// and asking again while it is on its way starts a second load racing the
+/// first; but a load begun while the application was in the background has
+/// been seen to sit uncommitted until asked for again, every second of the
+/// wait paid in front of the member, so the waiting is one period and no
+/// more.
+pub(crate) const PAGE_LOAD_BEGUN_WAITS: u32 = 1;
 
 /// A load of a lost page that has not reported in yet: which loss it
 /// recovers from, which attempt at that loss it is, and how many times the
