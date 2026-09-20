@@ -33,6 +33,14 @@ pub(crate) const PAGE_RELOAD_PATIENCE: Duration = Duration::from_secs(8);
 /// How many times a lost page is loaded again before the window is given up.
 pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
 
+/// A load of a lost page that has not reported in yet: which loss it
+/// recovers from, and which attempt at that loss it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingReload {
+    pub(crate) loss: u64,
+    pub(crate) attempt: u32,
+}
+
 /// The single top-level object that manages all the running windows, assets, shortcuts, etc
 pub(crate) struct App {
     // move the props into a cell so we can pop it out later to create the first window
@@ -47,10 +55,15 @@ pub(crate) struct App {
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
 
-    /// For each window whose page is being loaded again, how many times the
-    /// load has been asked for. A window is in here from the moment its page
-    /// is found lost until the new page reports in.
-    pub(crate) pending_reloads: HashMap<WindowId, u32>,
+    /// For each window whose page is being loaded again, which loss is being
+    /// recovered from and how many times the load has been asked for. A
+    /// window is in here from the moment its page is found lost until the new
+    /// page reports in.
+    pub(crate) pending_reloads: HashMap<WindowId, PendingReload>,
+
+    /// Every loss of a page is numbered, so that a clock started for one
+    /// loss cannot be mistaken for a clock started for a later one.
+    pub(crate) losses: u64,
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
@@ -86,6 +99,7 @@ impl App {
             is_visible_before_start: true,
             webviews: HashMap::new(),
             pending_reloads: HashMap::new(),
+            losses: 0,
             control_flow: ControlFlow::Wait,
             unmounted_dom: Cell::new(Some(virtual_dom)),
             float_all: false,
@@ -322,7 +336,8 @@ impl App {
     /// it has not, the load is asked for again, up to a limit past which the
     /// window is given up as lost rather than reloaded forever.
     pub fn reload_lost_page(&mut self, id: WindowId) {
-        self.load_lost_page(id, 1);
+        self.losses += 1;
+        self.load_lost_page(id, self.losses, 1);
     }
 
     /// The time an attempt to load a lost page again was given is up. If
@@ -330,8 +345,8 @@ impl App {
     /// in, and it is loaded again; if the page has since reported in, a later
     /// attempt has replaced this one, or the platform has reported the page
     /// lost afresh, there is nothing to do.
-    pub fn page_reload_due(&mut self, id: WindowId, attempt: u32) {
-        if self.pending_reloads.get(&id) != Some(&attempt) {
+    pub fn page_reload_due(&mut self, id: WindowId, loss: u64, attempt: u32) {
+        if self.pending_reloads.get(&id) != Some(&PendingReload { loss, attempt }) {
             return;
         }
         if attempt >= PAGE_RELOAD_ATTEMPTS {
@@ -347,7 +362,7 @@ impl App {
              again, so it is being loaded once more (attempt {} of {PAGE_RELOAD_ATTEMPTS}).",
             attempt + 1
         );
-        self.load_lost_page(id, attempt + 1);
+        self.load_lost_page(id, loss, attempt + 1);
     }
 
     /// Loads a lost page again and starts the clock on its reporting in.
@@ -355,11 +370,12 @@ impl App {
     /// A loss reported by the platform is attempt one, whatever came before
     /// it: a page lost afresh is a new loss, not a failed attempt at the last
     /// one. Only the attempts this clock asks for count toward the limit.
-    fn load_lost_page(&mut self, id: WindowId, attempt: u32) {
+    fn load_lost_page(&mut self, id: WindowId, loss: u64, attempt: u32) {
         let Some(view) = self.webviews.get(&id) else {
             return;
         };
-        self.pending_reloads.insert(id, attempt);
+        self.pending_reloads
+            .insert(id, PendingReload { loss, attempt });
 
         // The navigation guard lets the page load exactly once after the flag
         // is cleared, and the attempt before this one used that up.
@@ -387,7 +403,7 @@ impl App {
         let proxy = self.shared.proxy.clone();
         std::thread::spawn(move || {
             std::thread::sleep(PAGE_RELOAD_PATIENCE);
-            _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, attempt });
+            _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, loss, attempt });
         });
     }
 

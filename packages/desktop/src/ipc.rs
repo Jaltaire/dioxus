@@ -26,9 +26,12 @@ pub enum UserWindowEvent {
     PageLost(WindowId),
 
     /// The time a lost page was given to load again is up. If the page has
-    /// still not reported in, this attempt failed, and another is made.
+    /// still not reported in, this attempt failed, and another is made. The
+    /// loss is named so that a clock started for an earlier loss of the same
+    /// window says nothing about a later one.
     PageReloadDue {
         id: WindowId,
+        loss: u64,
         attempt: u32,
     },
 
