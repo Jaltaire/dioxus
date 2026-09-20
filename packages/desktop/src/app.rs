@@ -24,14 +24,22 @@ use tao::{
 /// How long a page loaded again after being lost is given to report in
 /// before the load is taken to have failed and asked for again.
 ///
-/// A page that loads at all reports in within a second or two; the wait is
-/// long enough for a web content process to be brought up on a phone under
-/// load, and short enough that a member watching an empty window is not kept
-/// waiting long for the next attempt.
+/// A page that loads at all reports in within a second or two. The wait
+/// has to cover the web content process being brought up first, since a
+/// load asked for while the platform is still launching that process is
+/// dropped on the floor, and only a load asked for once it is up begins:
+/// the clock is what turns a lost first load into a page.
 pub(crate) const PAGE_RELOAD_PATIENCE: Duration = Duration::from_secs(8);
 
-/// How many times a lost page is loaded again before the window is given up.
+/// How many quick attempts a lost page is given before the asking slows to
+/// [`PAGE_RELOAD_PATIENCE_LATER`]. The asking never stops: a web content
+/// process has been seen to take over a minute to launch on a loaded
+/// machine, and a window given up on is a window that stays empty until
+/// the application is force quit, which is the very thing being cured.
 pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
+
+/// How long between attempts once the quick ones are spent.
+pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
 
 /// A load of a lost page that has not reported in yet: which loss it
 /// recovers from, and which attempt at that loss it is.
@@ -39,6 +47,26 @@ pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
 pub(crate) struct PendingReload {
     pub(crate) loss: u64,
     pub(crate) attempt: u32,
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn the_quick_attempts_are_quick_and_the_rest_are_slow_and_never_stop() {
+        for attempt in 1..=PAGE_RELOAD_ATTEMPTS {
+            assert_eq!(App::page_reload_patience(attempt), PAGE_RELOAD_PATIENCE);
+        }
+        for attempt in [PAGE_RELOAD_ATTEMPTS + 1, 20, 1_000, u32::MAX] {
+            assert_eq!(
+                App::page_reload_patience(attempt),
+                PAGE_RELOAD_PATIENCE_LATER
+            );
+        }
+        assert!(PAGE_RELOAD_PATIENCE < PAGE_RELOAD_PATIENCE_LATER);
+        assert!(PAGE_RELOAD_PATIENCE >= Duration::from_secs(5));
+    }
 }
 
 /// The single top-level object that manages all the running windows, assets, shortcuts, etc
@@ -350,26 +378,38 @@ impl App {
             return;
         }
         if attempt >= PAGE_RELOAD_ATTEMPTS {
-            self.pending_reloads.remove(&id);
             tracing::error!(
-                "The page was loaded {PAGE_RELOAD_ATTEMPTS} times after its web content \
-                 process was terminated and never reported in, so the window is left as it is."
+                "The page was loaded {attempt} times after its web content process was \
+                 terminated and has not reported in; it is being loaded once more, and \
+                 will be every {PAGE_RELOAD_PATIENCE_LATER:?} until it does."
             );
-            return;
+        } else {
+            tracing::warn!(
+                "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
+                 again, so it is being loaded once more (attempt {} of {PAGE_RELOAD_ATTEMPTS}).",
+                attempt + 1
+            );
         }
-        tracing::warn!(
-            "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
-             again, so it is being loaded once more (attempt {} of {PAGE_RELOAD_ATTEMPTS}).",
-            attempt + 1
-        );
         self.load_lost_page(id, loss, attempt + 1);
+    }
+
+    /// How long an attempt is given: the quick ones a few seconds, the rest
+    /// half a minute, so a machine slow to bring a process up is asked
+    /// again rather than given up on, and not asked so often it never gets
+    /// there.
+    fn page_reload_patience(attempt: u32) -> Duration {
+        if attempt <= PAGE_RELOAD_ATTEMPTS {
+            PAGE_RELOAD_PATIENCE
+        } else {
+            PAGE_RELOAD_PATIENCE_LATER
+        }
     }
 
     /// Loads a lost page again and starts the clock on its reporting in.
     ///
     /// A loss reported by the platform is attempt one, whatever came before
     /// it: a page lost afresh is a new loss, not a failed attempt at the last
-    /// one. Only the attempts this clock asks for count toward the limit.
+    /// one. Only the attempts this clock asks for count toward the slowing.
     fn load_lost_page(&mut self, id: WindowId, loss: u64, attempt: u32) {
         let Some(view) = self.webviews.get(&id) else {
             return;
@@ -400,8 +440,9 @@ impl App {
         }
 
         let proxy = self.shared.proxy.clone();
+        let patience = Self::page_reload_patience(attempt);
         std::thread::spawn(move || {
-            std::thread::sleep(PAGE_RELOAD_PATIENCE);
+            std::thread::sleep(patience);
             _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, loss, attempt });
         });
     }
