@@ -21,6 +21,18 @@ use tao::{
     window::WindowId,
 };
 
+/// How long a page loaded again after being lost is given to report in
+/// before the load is taken to have failed and asked for again.
+///
+/// A page that loads at all reports in within a second or two; the wait is
+/// long enough for a web content process to be brought up on a phone under
+/// load, and short enough that a member watching an empty window is not kept
+/// waiting long for the next attempt.
+pub(crate) const PAGE_RELOAD_PATIENCE: Duration = Duration::from_secs(8);
+
+/// How many times a lost page is loaded again before the window is given up.
+pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
+
 /// The single top-level object that manages all the running windows, assets, shortcuts, etc
 pub(crate) struct App {
     // move the props into a cell so we can pop it out later to create the first window
@@ -34,6 +46,11 @@ pub(crate) struct App {
     pub(crate) exit_on_last_window_close: bool,
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
+
+    /// For each window whose page is being loaded again, how many times the
+    /// load has been asked for. A window is in here from the moment its page
+    /// is found lost until the new page reports in.
+    pub(crate) pending_reloads: HashMap<WindowId, u32>,
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
@@ -68,6 +85,7 @@ impl App {
             disable_dma_buf_on_wayland: cfg.disable_dma_buf_on_wayland,
             is_visible_before_start: true,
             webviews: HashMap::new(),
+            pending_reloads: HashMap::new(),
             control_flow: ControlFlow::Wait,
             unmounted_dom: Cell::new(Some(virtual_dom)),
             float_all: false,
@@ -221,6 +239,7 @@ impl App {
 
     pub fn window_destroyed(&mut self, id: WindowId) {
         self.webviews.remove(&id);
+        self.pending_reloads.remove(&id);
 
         if self.exit_on_last_window_close && self.webviews.is_empty() {
             self.control_flow = ControlFlow::Exit
@@ -294,10 +313,43 @@ impl App {
     /// into it from the virtual dom that never went anywhere.
     ///
     /// iOS does this to an application that has been in the background a while.
+    ///
+    /// The load is not trusted to finish. When the platform has taken the
+    /// networking process along with the web content process, or the GPU
+    /// process goes while the new page is still on its way, the load starts
+    /// and never commits, and a webview that never commits a load stays
+    /// empty for good. So the new page is given a while to report in, and if
+    /// it has not, the load is asked for again, up to a limit past which the
+    /// window is given up as lost rather than reloaded forever.
     pub fn reload_lost_page(&mut self, id: WindowId) {
         let Some(view) = self.webviews.get(&id) else {
             return;
         };
+
+        let attempt = self.pending_reloads.entry(id).or_insert(0);
+        *attempt += 1;
+        let attempt = *attempt;
+        if attempt > PAGE_RELOAD_ATTEMPTS {
+            self.pending_reloads.remove(&id);
+            tracing::error!(
+                "The page was asked for {PAGE_RELOAD_ATTEMPTS} times after its web content \
+                 process was terminated and never reported in, so the window is left as it is."
+            );
+            return;
+        }
+        if attempt > 1 {
+            tracing::warn!(
+                "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
+                 again, so it is being loaded once more (attempt {attempt} of \
+                 {PAGE_RELOAD_ATTEMPTS})."
+            );
+        }
+
+        // The navigation guard lets the page load exactly once after the flag
+        // is cleared, and the attempt before this one used that up.
+        view.desktop_context
+            .page_loaded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // The page that died never closed its connection, so what is sent next
         // would go to a channel nothing is reading. Forgetting it first means
@@ -315,12 +367,33 @@ impl App {
                  terminated, so the window will stay empty: {error}"
             );
         }
+
+        let proxy = self.shared.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(PAGE_RELOAD_PATIENCE);
+            _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, attempt });
+        });
+    }
+
+    /// The time an attempt to load a lost page again was given is up. If
+    /// that attempt is still the one being waited on, the page never reported
+    /// in, and it is loaded again; if the page has since reported in, or a
+    /// later attempt has replaced this one, there is nothing to do.
+    pub fn page_reload_due(&mut self, id: WindowId, attempt: u32) {
+        if self.pending_reloads.get(&id) != Some(&attempt) {
+            return;
+        }
+        self.reload_lost_page(id);
     }
 
     /// The webview is finally loaded
     ///
     /// Let's rebuild it and then start polling it
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
+        if self.pending_reloads.remove(&id).is_some() {
+            tracing::info!("The page loaded again and reported in.");
+        }
+
         let view = self.webviews.get_mut(&id).unwrap();
         let renderer_state = std::mem::take(&mut view.renderer_state);
 
