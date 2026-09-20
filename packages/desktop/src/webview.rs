@@ -358,6 +358,15 @@ impl WebviewInstance {
         // the page this guards is already gone.
         let page_loaded = Arc::new(AtomicBool::new(false));
 
+        // Set from the moment the page is lost until its replacement reports
+        // in. While it is set, every navigation to the page is allowed: the
+        // platform reloads the page on its own after taking its process, the
+        // application asks for it too, and a load refused in that window
+        // leaves the frame holding a document with none of the page's
+        // scripts in it -- one that can never report in, however many times
+        // it is asked for.
+        let page_awaited = Arc::new(AtomicBool::new(false));
+
         let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_bounds(wry::Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
@@ -371,6 +380,7 @@ impl WebviewInstance {
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler({
                 let page_loaded = page_loaded.clone();
+                let page_awaited = page_awaited.clone();
                 move |var: String| {
                     // Serve the index and assets.
                     if var.starts_with("dioxus://")
@@ -380,7 +390,8 @@ impl WebviewInstance {
                         // After the page has loaded once, don't allow any more navigation
                         let page_loaded =
                             page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
-                        return !page_loaded;
+                        return !page_loaded
+                            || page_awaited.load(std::sync::atomic::Ordering::SeqCst);
                     }
 
                     // External links always open somewhere else. Prevents the webview from navigating
@@ -415,6 +426,7 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtDarwin;
 
             let page_loaded = page_loaded.clone();
+            let page_awaited = page_awaited.clone();
             let (proxy, window_id) = (shared.proxy.to_owned(), window.id());
             webview = webview.with_on_web_content_process_terminate_handler(move || {
                 tracing::warn!(
@@ -423,6 +435,7 @@ impl WebviewInstance {
                 );
                 // Cleared before the reload is asked for, because the guard
                 // would refuse the very navigation being asked for.
+                page_awaited.store(true, std::sync::atomic::Ordering::SeqCst);
                 page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
                 _ = proxy.send_event(UserWindowEvent::PageLost(window_id));
             });
@@ -545,6 +558,7 @@ impl WebviewInstance {
             file_hover,
             cfg.window_close_behavior,
             page_loaded,
+            page_awaited,
         ));
 
         // Provide the desktop context to the virtual dom and edit handler

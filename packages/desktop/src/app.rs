@@ -41,12 +41,21 @@ pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
 /// How long between attempts once the quick ones are spent.
 pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
 
+/// How many times a load that has begun is given another period of patience
+/// to commit before it is taken to have stalled and asked for again. A load
+/// that has begun is on its way in almost every case, and asking again while
+/// it is on its way starts a second load racing the first; but a load can
+/// also begin and never commit, so the waiting is not for ever.
+pub(crate) const PAGE_LOAD_BEGUN_WAITS: u32 = 3;
+
 /// A load of a lost page that has not reported in yet: which loss it
-/// recovers from, and which attempt at that loss it is.
+/// recovers from, which attempt at that loss it is, and how many times the
+/// clock has found the load begun and waited on rather than asked again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingReload {
     pub(crate) loss: u64,
     pub(crate) attempt: u32,
+    pub(crate) begun_waits: u32,
 }
 
 #[cfg(test)]
@@ -374,9 +383,42 @@ impl App {
     /// attempt has replaced this one, or the platform has reported the page
     /// lost afresh, there is nothing to do.
     pub fn page_reload_due(&mut self, id: WindowId, loss: u64, attempt: u32) {
-        if self.pending_reloads.get(&id) != Some(&PendingReload { loss, attempt }) {
+        let Some(pending) = self.pending_reloads.get(&id).copied() else {
+            return;
+        };
+        if pending.loss != loss || pending.attempt != attempt {
             return;
         }
+
+        // A load that has begun -- the guard has seen its navigation -- is
+        // almost always about to commit and report in, and a second load
+        // asked for now would race it, so it is given more time first.
+        let begun = self
+            .webviews
+            .get(&id)
+            .map(|view| {
+                view.desktop_context
+                    .page_loaded
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap_or(false);
+        if begun && pending.begun_waits < PAGE_LOAD_BEGUN_WAITS {
+            let patience = Self::page_reload_patience(attempt);
+            tracing::info!(
+                "The page's load has begun but it has not reported in within {patience:?}; \
+                 it is given another {patience:?} before being asked for again."
+            );
+            self.pending_reloads.insert(
+                id,
+                PendingReload {
+                    begun_waits: pending.begun_waits + 1,
+                    ..pending
+                },
+            );
+            self.start_reload_clock(id, loss, attempt, patience);
+            return;
+        }
+
         if attempt >= PAGE_RELOAD_ATTEMPTS {
             tracing::error!(
                 "The page was loaded {attempt} times after its web content process was \
@@ -414,11 +456,21 @@ impl App {
         let Some(view) = self.webviews.get(&id) else {
             return;
         };
-        self.pending_reloads
-            .insert(id, PendingReload { loss, attempt });
+        self.pending_reloads.insert(
+            id,
+            PendingReload {
+                loss,
+                attempt,
+                begun_waits: 0,
+            },
+        );
 
-        // The navigation guard lets the page load exactly once after the flag
-        // is cleared, and the attempt before this one used that up.
+        // Every navigation to the page is allowed while it is awaited, and
+        // the flag the guard reads once the page is back is cleared so that
+        // the clock can tell whether this load has begun.
+        view.desktop_context
+            .page_awaited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         view.desktop_context
             .page_loaded
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -439,8 +491,11 @@ impl App {
             );
         }
 
+        self.start_reload_clock(id, loss, attempt, Self::page_reload_patience(attempt));
+    }
+
+    fn start_reload_clock(&self, id: WindowId, loss: u64, attempt: u32, patience: Duration) {
         let proxy = self.shared.proxy.clone();
-        let patience = Self::page_reload_patience(attempt);
         std::thread::spawn(move || {
             std::thread::sleep(patience);
             _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, loss, attempt });
@@ -456,6 +511,15 @@ impl App {
         }
 
         let view = self.webviews.get_mut(&id).unwrap();
+
+        // The page is back, and from here the guard lets it load exactly once
+        // more only when it is lost again.
+        view.desktop_context
+            .page_awaited
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        view.desktop_context
+            .page_loaded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         view.edits.wry_queue.page_arrived();
         view.edits

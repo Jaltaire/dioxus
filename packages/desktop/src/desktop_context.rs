@@ -81,6 +81,11 @@ pub struct DesktopService {
     /// again by clearing this first.
     pub(crate) page_loaded: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Whether the window's page is gone and its replacement has yet to
+    /// report in. While it is, every load of the page is allowed, not just
+    /// the first: see the navigation guard.
+    pub(crate) page_awaited: Arc<std::sync::atomic::AtomicBool>,
+
     /// The head elements this window's document has put into its page.
     ///
     /// Kept because a page can be replaced underneath a running application --
@@ -113,6 +118,7 @@ impl DesktopService {
         file_hover: NativeFileHover,
         close_behaviour: WindowCloseBehaviour,
         page_loaded: Arc<std::sync::atomic::AtomicBool>,
+        page_awaited: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             window,
@@ -122,6 +128,7 @@ impl DesktopService {
             file_hover,
             close_behaviour: Rc::new(Cell::new(close_behaviour)),
             page_loaded,
+            page_awaited,
             head_elements: Rc::new(RefCell::new(Vec::new())),
             query: Default::default(),
             #[cfg(target_os = "ios")]
@@ -140,6 +147,8 @@ impl DesktopService {
     /// page a question and getting no answer. The page is loaded once more,
     /// the virtual dom is rebuilt into it, and the head is put back.
     pub fn reload_lost_page(&self) {
+        self.page_awaited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.page_loaded
             .store(false, std::sync::atomic::Ordering::SeqCst);
         _ = self
