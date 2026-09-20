@@ -59,6 +59,9 @@ pub(crate) struct PendingReload {
     pub(crate) loss: u64,
     pub(crate) attempt: u32,
     pub(crate) begun_waits: u32,
+    /// Whether the clock ran out while the window was not in the foreground,
+    /// so the asking waits for the window to come back.
+    pub(crate) deferred: bool,
 }
 
 #[cfg(test)]
@@ -101,6 +104,10 @@ pub(crate) struct App {
     /// page reports in.
     pub(crate) pending_reloads: HashMap<WindowId, PendingReload>,
 
+    /// Which windows are in the foreground. A window absent here is taken
+    /// to be in the foreground, as it is when it is first shown.
+    pub(crate) window_focus: HashMap<WindowId, bool>,
+
     /// Every loss of a page is numbered, so that a clock started for one
     /// loss cannot be mistaken for a clock started for a later one.
     pub(crate) losses: u64,
@@ -139,6 +146,7 @@ impl App {
             is_visible_before_start: true,
             webviews: HashMap::new(),
             pending_reloads: HashMap::new(),
+            window_focus: HashMap::new(),
             losses: 0,
             control_flow: ControlFlow::Wait,
             unmounted_dom: Cell::new(Some(virtual_dom)),
@@ -294,6 +302,7 @@ impl App {
     pub fn window_destroyed(&mut self, id: WindowId) {
         self.webviews.remove(&id);
         self.pending_reloads.remove(&id);
+        self.window_focus.remove(&id);
 
         if self.exit_on_last_window_close && self.webviews.is_empty() {
             self.control_flow = ControlFlow::Exit
@@ -393,6 +402,25 @@ impl App {
             return;
         }
 
+        // Nothing loads while the window is in the background: the platform
+        // holds the load until the window is back, and every load asked for
+        // meanwhile is one more page racing the others when it is. The
+        // asking waits for the window instead.
+        if !self.window_focus.get(&id).copied().unwrap_or(true) {
+            tracing::info!(
+                "The page has not reported in and the window is not in the foreground; it \
+                 will be asked for again when the window is."
+            );
+            self.pending_reloads.insert(
+                id,
+                PendingReload {
+                    deferred: true,
+                    ..pending
+                },
+            );
+            return;
+        }
+
         // A load that has begun -- the guard has seen its navigation -- is
         // almost always about to commit and report in, and a second load
         // asked for now would race it, so it is given more time first.
@@ -438,6 +466,36 @@ impl App {
         self.load_lost_page(id, loss, attempt + 1);
     }
 
+    /// The window has come to the foreground or left it.
+    ///
+    /// A page lost while the window was in the background has had its clock
+    /// deferred; now that the window is back, the load the platform held is
+    /// given one period to report in, and asked for again if it does not.
+    pub fn window_focus_changed(&mut self, id: WindowId, focused: bool) {
+        self.window_focus.insert(id, focused);
+        if !focused {
+            return;
+        }
+        let Some(pending) = self.pending_reloads.get(&id).copied() else {
+            return;
+        };
+        if !pending.deferred {
+            return;
+        }
+        self.pending_reloads.insert(
+            id,
+            PendingReload {
+                deferred: false,
+                ..pending
+            },
+        );
+        tracing::info!(
+            "The window is back in the foreground with its page still awaited; the page is \
+             given {PAGE_RELOAD_PATIENCE:?} to report in."
+        );
+        self.start_reload_clock(id, pending.loss, pending.attempt, PAGE_RELOAD_PATIENCE);
+    }
+
     /// How long an attempt is given: the quick ones a few seconds, the rest
     /// half a minute, so a machine slow to bring a process up is asked
     /// again rather than given up on, and not asked so often it never gets
@@ -465,6 +523,7 @@ impl App {
                 loss,
                 attempt,
                 begun_waits: 0,
+                deferred: false,
             },
         );
 
