@@ -62,10 +62,14 @@ impl WryQueue {
     pub(crate) fn forget_connection(&self) {
         let mut inner = self.inner.borrow_mut();
         tracing::info!(
-            "Webview {} forgets its edits connection.",
+            "Webview {} forgets its edits connection and awaits a page.",
             inner.location.webview_id
         );
         inner.websocket.forget_connection(inner.location.webview_id);
+        // Until the new page reports in, anything the virtual dom renders is
+        // a diff against the page that is gone. Sent on, it would be the first
+        // thing the new page received: edits to nodes it has never had.
+        inner.page_awaited = true;
         // The page owed an acknowledgement for the last edits it was sent, and
         // cannot give one now. Left in place it is waited on for good: the
         // virtual dom is held back until the edits in flight are flushed, so
@@ -83,12 +87,31 @@ impl WryQueue {
         let mut myself = self.inner.borrow_mut();
         let webview_id = myself.location.webview_id;
         let serialized_edits = myself.mutation_state.export_memory();
-        tracing::info!(
+        if myself.page_awaited {
+            tracing::debug!(
+                "Webview {webview_id} rendered {} bytes of edits to a page that is gone; they are dropped.",
+                serialized_edits.len()
+            );
+            return;
+        }
+        tracing::trace!(
             "Webview {webview_id} is sent {} bytes of edits.",
             serialized_edits.len()
         );
         let receiver = myself.websocket.send_edits(webview_id, serialized_edits);
         myself.edits_in_progress = Some(receiver);
+    }
+
+    /// The page this webview was waiting for has reported in.
+    ///
+    /// Whatever was rendered while it was awaited has been dropped, and the
+    /// page knows no templates yet, so the state that numbers them starts
+    /// over: the rebuild that follows sends every template the page needs.
+    pub(crate) fn page_arrived(&self) {
+        let mut myself = self.inner.borrow_mut();
+        myself.page_awaited = false;
+        myself.edits_in_progress = None;
+        myself.mutation_state = MutationState::default();
     }
 
     /// Wait until all pending edits have been rendered in the webview
@@ -147,6 +170,9 @@ pub(crate) struct WryQueueInner {
     websocket: EditWebsocket,
     // If this webview is currently waiting for an edit to be flushed. We don't run the virtual dom while this is true to avoid running effects before the dom has been updated
     edits_in_progress: Option<oneshot::Receiver<()>>,
+    /// Whether the page is gone and its replacement has yet to report in.
+    /// Edits rendered meanwhile describe the page that is gone and are dropped.
+    page_awaited: bool,
     // The socket may be killed by the OS while running. If it does, this channel will receive the new server location
     server_location_changed: Arc<Notify>,
     server_location_changed_future: Pin<Box<dyn Future<Output = ()>>>,
@@ -195,9 +221,6 @@ pub(crate) struct EditWebsocket {
     current_location: Arc<Mutex<ServerLocation>>,
     max_webview_id: Arc<AtomicU32>,
     connections: Arc<RwLock<HashMap<u32, WebviewConnectionState>>>,
-    /// Every accepted connection is numbered, so that the thread serving one
-    /// can tell whether the table still refers to it before writing there.
-    next_connection: Arc<AtomicU64>,
     server_location: Arc<Notify>,
 }
 
@@ -209,25 +232,26 @@ impl EditWebsocket {
         let (location, server) = start_server();
         let current_location = Arc::new(Mutex::new(location));
 
+        // Every accepted connection is numbered, so that the thread serving
+        // one can tell whether the table still refers to it before writing
+        // there.
         let next_connection = Arc::new(AtomicU64::new(0));
         let connections_ = connections.clone();
         let current_location_ = current_location.clone();
         let notify_ = notify.clone();
-        let next_connection_ = next_connection.clone();
         std::thread::spawn(move || {
             Self::accept_loop(
                 notify_,
                 server,
                 current_location_,
                 connections_,
-                next_connection_,
+                next_connection,
             )
         });
 
         Self {
             connections,
             max_webview_id: Default::default(),
-            next_connection,
             current_location,
             server_location: notify,
         }
@@ -359,7 +383,7 @@ impl EditWebsocket {
                 let data = msg.edits.clone();
                 queued_message = Some(msg);
                 // Send the edits to the webview
-                tracing::info!(
+                tracing::trace!(
                     "Edits connection {connection_number} of webview {} sends {} bytes.",
                     location.webview_id,
                     data.len()
@@ -385,7 +409,7 @@ impl EditWebsocket {
                 }
 
                 let msg = queued_message.take().expect("Message should be set here");
-                tracing::info!(
+                tracing::trace!(
                     "Edits connection {connection_number} of webview {} has its edits applied.",
                     location.webview_id
                 );
@@ -410,7 +434,7 @@ impl EditWebsocket {
                 connections.get(&location.webview_id),
                 Some(WebviewConnectionState::Connected { connection, .. }) if *connection == connection_number
             );
-            tracing::info!(
+            tracing::debug!(
                 "Edits connection {connection_number} of webview {} ended; the table {} refers to it.",
                 location.webview_id,
                 if still_mine { "still" } else { "no longer" }
@@ -428,7 +452,7 @@ impl EditWebsocket {
         match connections.remove(&location.webview_id) {
             // If there are pending edits, send them to the new connection
             Some(WebviewConnectionState::Pending { mut pending }) => {
-                tracing::info!(
+                tracing::debug!(
                     "Webview {} opened edits connection {connection_number}; {} batches were waiting.",
                     location.webview_id,
                     pending.len()
@@ -448,14 +472,14 @@ impl EditWebsocket {
             // that no longer exists. The new one is rebuilt from the virtual dom
             // when it reports in, which is the whole of what it needs.
             Some(WebviewConnectionState::Connected { .. }) => {
-                tracing::info!(
+                tracing::debug!(
                     "Webview {} opened edits connection {connection_number} over one still open, which is dropped.",
                     location.webview_id
                 );
             }
 
             None => {
-                tracing::info!(
+                tracing::debug!(
                     "Webview {} opened edits connection {connection_number}, its first.",
                     location.webview_id
                 );
@@ -484,6 +508,7 @@ impl EditWebsocket {
                 location: WebviewWebsocketLocation { webview_id, server },
                 websocket: self.clone(),
                 edits_in_progress: None,
+                page_awaited: false,
                 mutation_state: MutationState::default(),
             })),
         }
@@ -656,6 +681,44 @@ mod connection_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("The new page's acknowledgement never reached the virtual dom.");
+    }
+
+    #[test]
+    fn edits_rendered_while_a_page_is_awaited_are_dropped_and_the_rebuild_starts_the_templates_over()
+     {
+        let server = EditWebsocket::start();
+        let queue = server.create_queue();
+        let webview = queue.inner.borrow().location.webview_id;
+
+        // A first page had edits written for it.
+        queue.with_mutation_state_mut(|state| {
+            dioxus_core::WriteMutations::create_text_node(state, "gone", dioxus_core::ElementId(1))
+        });
+        queue.forget_connection();
+
+        // The virtual dom renders while the page is awaited: a diff against the
+        // page that is gone. Nothing of it may reach the table.
+        queue.send_edits();
+        assert!(matches!(
+            server.connections.read().unwrap().get(&webview),
+            Some(WebviewConnectionState::Pending { pending }) if pending.is_empty()
+        ));
+        assert!(queue.inner.borrow().edits_in_progress.is_none());
+
+        // The new page reports in: the templates start over and the rebuild
+        // is the first batch the page will receive.
+        queue.page_arrived();
+        assert_eq!(
+            queue.with_mutation_state_mut(|state| state.export_memory()),
+            MutationState::default().export_memory(),
+            "The new page's edits state carries something of the old page's."
+        );
+        queue.send_edits();
+        assert!(matches!(
+            server.connections.read().unwrap().get(&webview),
+            Some(WebviewConnectionState::Pending { pending }) if pending.len() == 1
+        ));
+        assert!(queue.inner.borrow().edits_in_progress.is_some());
     }
 
     #[test]

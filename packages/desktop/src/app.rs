@@ -418,6 +418,7 @@ impl App {
         let view = self.webviews.get_mut(&id).unwrap();
         let renderer_state = std::mem::take(&mut view.renderer_state);
 
+        view.edits.wry_queue.page_arrived();
         view.edits
             .wry_queue
             .with_mutation_state_mut(|f| view.dom.rebuild_into_a_new_page(f));
