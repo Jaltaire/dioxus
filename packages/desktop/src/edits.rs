@@ -29,7 +29,7 @@ use std::net::{TcpListener, TcpStream};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::{
     net::IpAddr,
     sync::{Arc, RwLock},
@@ -187,6 +187,9 @@ pub(crate) struct EditWebsocket {
     current_location: Arc<Mutex<ServerLocation>>,
     max_webview_id: Arc<AtomicU32>,
     connections: Arc<RwLock<HashMap<u32, WebviewConnectionState>>>,
+    /// Every accepted connection is numbered, so that the thread serving one
+    /// can tell whether the table still refers to it before writing there.
+    next_connection: Arc<AtomicU64>,
     server_location: Arc<Notify>,
 }
 
@@ -198,16 +201,25 @@ impl EditWebsocket {
         let (location, server) = start_server();
         let current_location = Arc::new(Mutex::new(location));
 
+        let next_connection = Arc::new(AtomicU64::new(0));
         let connections_ = connections.clone();
         let current_location_ = current_location.clone();
         let notify_ = notify.clone();
+        let next_connection_ = next_connection.clone();
         std::thread::spawn(move || {
-            Self::accept_loop(notify_, server, current_location_, connections_)
+            Self::accept_loop(
+                notify_,
+                server,
+                current_location_,
+                connections_,
+                next_connection_,
+            )
         });
 
         Self {
             connections,
             max_webview_id: Default::default(),
+            next_connection,
             current_location,
             server_location: notify,
         }
@@ -222,11 +234,17 @@ impl EditWebsocket {
         mut server: TcpListener,
         current_location: Arc<Mutex<ServerLocation>>,
         connections: Arc<RwLock<HashMap<u32, WebviewConnectionState>>>,
+        next_connection: Arc<AtomicU64>,
     ) {
         loop {
             // Accept connections until we hit an error
             while let Ok((stream, _)) = server.accept() {
-                Self::handle_connection(stream, current_location.clone(), connections.clone());
+                Self::handle_connection(
+                    stream,
+                    current_location.clone(),
+                    connections.clone(),
+                    next_connection.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                );
             }
 
             // Switch ports and reconnect on a different port if the server is killed by the OS. This
@@ -246,6 +264,7 @@ impl EditWebsocket {
         stream: TcpStream,
         server_location: Arc<Mutex<ServerLocation>>,
         connections: Arc<RwLock<HashMap<u32, WebviewConnectionState>>>,
+        connection_number: u64,
     ) {
         use tungstenite::handshake::server::{Request, Response};
 
@@ -360,14 +379,27 @@ impl EditWebsocket {
                 }
             }
             tracing::trace!("Webview {} closed the connection", location.webview_id);
-            let mut connection = WebviewConnectionState::default();
-            if let Some(msg) = queued_message {
-                connection.add_message_pair(msg);
+            // A page whose process was terminated never closes its connection,
+            // and the thread serving it learns of the loss only when the
+            // sender it waits on is dropped -- which is the moment the page
+            // that replaces it connects. Writing a pending state then would
+            // wipe the new page's connection from the table, and every edit
+            // from there on would be queued for a page that never comes. So
+            // the table is only put back to pending while it still refers to
+            // this connection; edits owed to a page that has been replaced
+            // describe a page that no longer exists, and are dropped with it.
+            let mut connections = connections_.write().unwrap();
+            let still_mine = matches!(
+                connections.get(&location.webview_id),
+                Some(WebviewConnectionState::Connected { connection, .. }) if *connection == connection_number
+            );
+            if still_mine {
+                let mut connection = WebviewConnectionState::default();
+                if let Some(msg) = queued_message {
+                    connection.add_message_pair(msg);
+                }
+                connections.insert(location.webview_id, connection);
             }
-            connections_
-                .write()
-                .unwrap()
-                .insert(location.webview_id, connection);
         });
 
         let mut connections = connections.write().unwrap();
@@ -400,7 +432,10 @@ impl EditWebsocket {
 
         connections.insert(
             location.webview_id,
-            WebviewConnectionState::Connected { edits_outgoing },
+            WebviewConnectionState::Connected {
+                edits_outgoing,
+                connection: connection_number,
+            },
         );
     }
 
@@ -445,6 +480,7 @@ enum WebviewConnectionState {
     },
     Connected {
         edits_outgoing: std::sync::mpsc::Sender<MsgPair>,
+        connection: u64,
     },
 }
 
@@ -476,7 +512,7 @@ impl WebviewConnectionState {
             WebviewConnectionState::Pending { pending: queue } => {
                 queue.push_back(pair);
             }
-            WebviewConnectionState::Connected { edits_outgoing } => {
+            WebviewConnectionState::Connected { edits_outgoing, .. } => {
                 _ = edits_outgoing.send(pair);
             }
         }
@@ -508,6 +544,113 @@ fn create_secure_key() -> EncodedKey {
     let mut expected_key: EncodedKey = [0u8; KEY_SIZE];
     secure_rng.fill_bytes(&mut expected_key);
     expected_key
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn connect(server: &EditWebsocket, queue: &WryQueue) -> tungstenite::WebSocket<TcpStream> {
+        let stream = TcpStream::connect((
+            IpAddr::from([127, 0, 0, 1]),
+            server.current_location.lock().unwrap().port,
+        ))
+        .unwrap();
+        let (mut websocket, _) = tungstenite::client(queue.edits_path(), stream).unwrap();
+        let greeting = websocket.read().unwrap();
+        assert_eq!(greeting.into_text().unwrap(), queue.required_server_key());
+        websocket
+    }
+
+    fn connected(server: &EditWebsocket, webview: u32) -> bool {
+        for _ in 0..100 {
+            if matches!(
+                server.connections.read().unwrap().get(&webview),
+                Some(WebviewConnectionState::Connected { .. })
+            ) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn send(server: &mut EditWebsocket, webview: u32, edits: &[u8]) -> oneshot::Receiver<()> {
+        server.send_edits(webview, edits.to_vec())
+    }
+
+    fn receive(websocket: &mut tungstenite::WebSocket<TcpStream>) -> Vec<u8> {
+        loop {
+            if let tungstenite::Message::Binary(edits) = websocket.read().unwrap() {
+                return edits.to_vec();
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_that_replaces_another_keeps_its_connection() {
+        let mut server = EditWebsocket::start();
+        let queue = server.create_queue();
+        let webview = queue.inner.borrow().location.webview_id;
+
+        // The first page never closes its connection: its process was
+        // terminated, or a second load of the page overtook it.
+        let _first = connect(&server, &queue);
+        assert!(connected(&server, webview));
+        let mut second = connect(&server, &queue);
+        assert!(connected(&server, webview));
+
+        // The first connection's thread learnt of its replacement the moment
+        // the second connected. Give it every chance to write to the table.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            matches!(
+                server.connections.read().unwrap().get(&webview),
+                Some(WebviewConnectionState::Connected { .. })
+            ),
+            "The replaced page's thread put the table back to pending over the new page."
+        );
+
+        let mut applied = send(&mut server, webview, b"rebuild");
+        assert_eq!(receive(&mut second), b"rebuild");
+        second
+            .send(tungstenite::Message::Binary(vec![1].into()))
+            .unwrap();
+        for _ in 0..100 {
+            if let Ok(Some(())) = applied.try_recv() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("The new page's acknowledgement never reached the virtual dom.");
+    }
+
+    #[test]
+    fn a_page_that_closes_its_own_connection_leaves_the_table_pending() {
+        let mut server = EditWebsocket::start();
+        let queue = server.create_queue();
+        let webview = queue.inner.borrow().location.webview_id;
+
+        let mut only = connect(&server, &queue);
+        assert!(connected(&server, webview));
+        only.close(None).unwrap();
+        drop(only);
+
+        // The server learns of a close only when it next has edits to send,
+        // and re-queues those for the page that comes next.
+        let _owed = send(&mut server, webview, b"owed");
+        for _ in 0..100 {
+            if matches!(
+                server.connections.read().unwrap().get(&webview),
+                Some(WebviewConnectionState::Pending { pending }) if pending.len() == 1
+            ) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("The closed connection's edits were not queued for the next page.");
+    }
 }
 
 #[test]
