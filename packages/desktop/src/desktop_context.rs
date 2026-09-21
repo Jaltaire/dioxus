@@ -86,6 +86,10 @@ pub struct DesktopService {
     /// the first: see the navigation guard.
     pub(crate) page_awaited: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Whether the page's document has been asked for since the page was
+    /// last lost: a load that is under way, not merely asked for.
+    pub(crate) page_begun: Arc<std::sync::atomic::AtomicBool>,
+
     /// The head elements this window's document has put into its page.
     ///
     /// Kept because a page can be replaced underneath a running application --
@@ -118,6 +122,7 @@ impl DesktopService {
         close_behaviour: WindowCloseBehaviour,
         page_loaded: Arc<std::sync::atomic::AtomicBool>,
         page_awaited: Arc<std::sync::atomic::AtomicBool>,
+        page_begun: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             window,
@@ -128,6 +133,7 @@ impl DesktopService {
             close_behaviour: Rc::new(Cell::new(close_behaviour)),
             page_loaded,
             page_awaited,
+            page_begun,
             head_elements: Rc::new(RefCell::new(Vec::new())),
             query: Default::default(),
             #[cfg(target_os = "ios")]

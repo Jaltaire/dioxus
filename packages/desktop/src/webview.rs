@@ -280,6 +280,12 @@ impl WebviewInstance {
         let file_hover = NativeFileHover::default();
         let headless = !cfg.window.window.visible;
 
+        // Set when the page's own document is asked for, which the platform
+        // does only once the process that will draw it is up and loading: the
+        // one sign that a load of the page is truly under way, as opposed to
+        // asked for. Cleared when the page is lost.
+        let page_begun = Arc::new(AtomicBool::new(false));
+
         let request_handler = {
             to_owned![
                 cfg.custom_head,
@@ -288,13 +294,20 @@ impl WebviewInstance {
                 asset_handlers,
                 edits
             ];
+            let page_begun = page_begun.clone();
 
             #[cfg(feature = "tokio_runtime")]
             let tokio_rt = tokio::runtime::Handle::current();
 
-            move |_id: WebViewId, request, responder: RequestAsyncResponder| {
+            move |_id: WebViewId,
+                  request: wry::http::Request<Vec<u8>>,
+                  responder: RequestAsyncResponder| {
                 #[cfg(feature = "tokio_runtime")]
                 let _guard = tokio_rt.enter();
+
+                if request.uri().path() == "/" {
+                    page_begun.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
 
                 protocol::desktop_handler(
                     request,
@@ -571,6 +584,7 @@ impl WebviewInstance {
             cfg.window_close_behavior,
             page_loaded,
             page_awaited,
+            page_begun,
         ));
 
         // Provide the desktop context to the virtual dom and edit handler

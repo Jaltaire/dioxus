@@ -1,19 +1,28 @@
 use serde::{Deserialize, Serialize};
 use tao::window::WindowId;
 
+/// The events the desktop renderer sends itself through the event loop.
+///
+/// An application sees them through `use_wry_event_handler`, and may act on
+/// the ones that concern it -- a page lost to the platform, say -- while the
+/// renderer does its own part.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub enum UserWindowEvent {
     /// A global hotkey event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     GlobalHotKeyEvent(global_hotkey::GlobalHotKeyEvent),
 
+    /// A menu bar event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     MudaMenuEvent(muda::MenuEvent),
 
+    /// A tray icon event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     TrayIconEvent(tray_icon::TrayIconEvent),
 
+    /// A tray menu event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     TrayMenuEvent(tray_icon::menu::MenuEvent),
 
