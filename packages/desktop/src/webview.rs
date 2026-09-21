@@ -195,19 +195,11 @@ impl WebviewEdits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RendererState {
-    #[default]
-    Initial,
-    Replaced,
-}
-
 pub(crate) struct WebviewInstance {
     pub dom: VirtualDom,
     pub edits: WebviewEdits,
     pub desktop_context: DesktopContext,
     pub waker: Waker,
-    pub renderer_state: RendererState,
 
     // Wry assumes the webcontext is alive for the lifetime of the webview.
     // We need to keep the webcontext alive, otherwise the webview will crash
@@ -605,7 +597,6 @@ impl WebviewInstance {
             edits,
             waker: tao_waker(shared.proxy.clone(), desktop_context.window.id()),
             desktop_context,
-            renderer_state: RendererState::Initial,
             _menu: menu,
             _web_context: web_context,
         }

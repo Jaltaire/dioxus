@@ -5,7 +5,7 @@ use crate::{
     ipc::{IpcMessage, UserWindowEvent},
     query::QueryResult,
     shortcut::ShortcutRegistry,
-    webview::{PendingWebview, RendererState, WebviewInstance},
+    webview::{PendingWebview, WebviewInstance},
 };
 use dioxus_core::VirtualDom;
 use std::{
@@ -556,7 +556,6 @@ impl App {
         // would go to a channel nothing is reading. Forgetting it first means
         // the edits that rebuild the new page are queued for it instead.
         view.edits.wry_queue.forget_connection();
-        view.renderer_state = RendererState::Replaced;
 
         if let Err(error) = view
             .desktop_context
@@ -599,7 +598,6 @@ impl App {
         }
 
         let view = self.webviews.get_mut(&id).unwrap();
-        let renderer_state = std::mem::take(&mut view.renderer_state);
 
         // The page is back, and from here the guard lets it load exactly once
         // more only when it is lost again.
