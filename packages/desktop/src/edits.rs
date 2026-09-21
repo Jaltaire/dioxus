@@ -414,9 +414,15 @@ impl EditWebsocket {
                     location.webview_id
                 );
 
-                // Notify that the edits have been applied
+                // Notify that the edits have been applied. Nobody is waiting
+                // when the page these edits were for has gone while they were
+                // in flight: its connection was forgotten, and with it the wait.
                 if msg.response.send(()).is_err() {
-                    tracing::error!("Error sending edits applied notification");
+                    tracing::debug!(
+                        "Edits connection {connection_number} of webview {} had its edits \
+                         acknowledged after the page they were for was gone.",
+                        location.webview_id
+                    );
                 }
             }
             tracing::trace!("Webview {} closed the connection", location.webview_id);
