@@ -41,6 +41,13 @@ pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
 /// How long between attempts once the quick ones are spent.
 pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
 
+/// How soon after a page is asked for a report of a page loaded can only be
+/// the page being replaced. A load takes the platform at least a second when
+/// the process is already up; a page that reports in within this of the
+/// asking finished loading before the asking, and the load just asked for is
+/// about to take its place. The wait goes on past such a report.
+pub(crate) const PAGE_REPORT_TOO_SOON: Duration = Duration::from_millis(400);
+
 /// How many times a load that has begun is given another period of patience
 /// to commit before it is taken to have stalled and asked for again. A load
 /// that has begun usually commits within a moment of its process being up,
@@ -62,6 +69,8 @@ pub(crate) struct PendingReload {
     /// Whether the clock ran out while the window was not in the foreground,
     /// so the asking waits for the window to come back.
     pub(crate) deferred: bool,
+    /// When the page was last asked for.
+    pub(crate) asked_at: std::time::Instant,
 }
 
 #[cfg(test)]
@@ -421,15 +430,17 @@ impl App {
             return;
         }
 
-        // A load that has begun -- the guard has seen its navigation -- is
+        // A load that is under way -- the page's document has been asked
+        // for, which happens only once the process drawing it is up -- is
         // almost always about to commit and report in, and a second load
-        // asked for now would race it, so it is given more time first.
+        // asked for now would race it, so it is given more time first. A
+        // load merely asked for, with no process yet to load it, is not.
         let begun = self
             .webviews
             .get(&id)
             .map(|view| {
                 view.desktop_context
-                    .page_loaded
+                    .page_begun
                     .load(std::sync::atomic::Ordering::SeqCst)
             })
             .unwrap_or(false);
@@ -524,6 +535,7 @@ impl App {
                 attempt,
                 begun_waits: 0,
                 deferred: false,
+                asked_at: std::time::Instant::now(),
             },
         );
 
@@ -535,6 +547,9 @@ impl App {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         view.desktop_context
             .page_loaded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        view.desktop_context
+            .page_begun
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // The page that died never closed its connection, so what is sent next
@@ -568,8 +583,18 @@ impl App {
     ///
     /// Let's rebuild it and then start polling it
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
-        if self.pending_reloads.remove(&id).is_some() {
-            tracing::info!("The page loaded again and reported in.");
+        if let Some(pending) = self.pending_reloads.get(&id).copied() {
+            let since_asked = pending.asked_at.elapsed();
+            if since_asked < PAGE_REPORT_TOO_SOON && !pending.deferred {
+                tracing::warn!(
+                    "A page reported in {since_asked:?} after the page was asked for again, so it \
+                     is the page being replaced; it is drawn into, and the wait for the one \
+                     asked for goes on."
+                );
+            } else {
+                self.pending_reloads.remove(&id);
+                tracing::info!("The page loaded again and reported in.");
+            }
         }
 
         let view = self.webviews.get_mut(&id).unwrap();
