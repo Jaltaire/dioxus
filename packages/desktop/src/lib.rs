@@ -17,6 +17,7 @@ mod element;
 mod event_handlers;
 mod events;
 mod file_upload;
+mod head_record;
 mod hooks;
 mod ipc;
 mod menubar;

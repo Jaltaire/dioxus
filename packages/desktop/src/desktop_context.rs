@@ -3,6 +3,7 @@ use crate::{
     app::SharedContext,
     assets::AssetHandlerRegistry,
     file_upload::NativeFileHover,
+    head_record::HeadRecord,
     ipc::UserWindowEvent,
     query::QueryEngine,
     shortcut::{HotKey, HotKeyState, ShortcutHandle, ShortcutRegistryError},
@@ -96,8 +97,10 @@ pub struct DesktopService {
     /// the platform terminates the process drawing it and it is loaded again --
     /// and the replacement must receive these elements before remounted effects
     /// run. Without this record, the new page can initially have an empty head
-    /// and render without styling.
-    pub(crate) head_elements: Rc<RefCell<Vec<String>>>,
+    /// and render without styling. Every replacement receives all of them, not
+    /// only the first: a remounted component that de-duplicates what it puts
+    /// into the head, as a stylesheet link does, never puts it in again.
+    pub(crate) head_elements: Rc<RefCell<HeadRecord>>,
 
     #[cfg(target_os = "ios")]
     pub(crate) views: Rc<std::cell::RefCell<Vec<Retained<UIView>>>>,
@@ -134,7 +137,7 @@ impl DesktopService {
             page_loaded,
             page_awaited,
             page_begun,
-            head_elements: Rc::new(RefCell::new(Vec::new())),
+            head_elements: Rc::new(RefCell::new(HeadRecord::default())),
             query: Default::default(),
             #[cfg(target_os = "ios")]
             views: Default::default(),
@@ -230,15 +233,16 @@ impl DesktopService {
     /// Records a script that puts an element into the head, so that it can be
     /// put into a page that replaces this one.
     pub(crate) fn remember_head_element(&self, js: String) {
-        self.head_elements.borrow_mut().push(js);
+        self.head_elements.borrow_mut().remember(js);
     }
 
     /// Puts every remembered head element into the page again.
     ///
-    /// Called once a page that replaced another is ready. On a page that
-    /// replaced nothing there is nothing remembered yet, so this does nothing.
+    /// Called once a page that replaced another is ready, however many pages
+    /// were replaced before it. On a page that replaced nothing there is
+    /// nothing remembered yet, so this does nothing.
     pub(crate) fn replay_head_elements(&self) {
-        let scripts = std::mem::take(&mut *self.head_elements.borrow_mut());
+        let scripts = self.head_elements.borrow().scripts();
         if scripts.is_empty() {
             return;
         }
