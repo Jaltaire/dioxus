@@ -190,16 +190,6 @@ impl WriteMutations for MutationWriter<'_> {
         id: ElementId,
     ) {
         let node_id = self.state.element_to_node_id(id);
-        fn is_falsy(val: &AttributeValue) -> bool {
-            match val {
-                AttributeValue::None => true,
-                AttributeValue::Text(val) => val == "false",
-                AttributeValue::Bool(val) => !val,
-                AttributeValue::Int(val) => *val == 0,
-                AttributeValue::Float(val) => *val == 0.0,
-                _ => false,
-            }
-        }
 
         // Set/unset subdocument for <web-view __webview_document>
         if local_name == "__webview_document" {
@@ -239,25 +229,24 @@ impl WriteMutations for MutationWriter<'_> {
             }
         }
 
-        let falsy = is_falsy(value);
         match value {
             AttributeValue::None => {
-                set_attribute_inner(&mut self.docm, local_name, ns, None, falsy, node_id)
+                set_attribute_inner(&mut self.docm, local_name, ns, None, node_id)
             }
             AttributeValue::Text(value) => {
-                set_attribute_inner(&mut self.docm, local_name, ns, Some(value), falsy, node_id)
+                set_attribute_inner(&mut self.docm, local_name, ns, Some(value), node_id)
             }
             AttributeValue::Float(value) => {
                 let value = value.to_string();
-                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), falsy, node_id);
+                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), node_id);
             }
             AttributeValue::Int(value) => {
                 let value = value.to_string();
-                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), falsy, node_id);
+                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), node_id);
             }
             AttributeValue::Bool(value) => {
                 let value = value.to_string();
-                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), falsy, node_id);
+                set_attribute_inner(&mut self.docm, local_name, ns, Some(&value), node_id);
             }
             _ => {
                 // FIXME: support all attribute types
@@ -337,8 +326,7 @@ fn create_template_node(docm: &mut DocumentMutator<'_>, node: &TemplateNode) -> 
                 else {
                     continue;
                 };
-                let falsy = *value == "false";
-                set_attribute_inner(docm, name, *namespace, Some(value), falsy, node_id);
+                set_attribute_inner(docm, name, *namespace, Some(value), node_id);
             }
 
             let child_ids: Vec<NodeId> = children
@@ -355,12 +343,50 @@ fn create_template_node(docm: &mut DocumentMutator<'_>, node: &TemplateNode) -> 
     }
 }
 
+/// The attributes that the web interpreter treats as present or absent rather
+/// than as carrying a value. It removes one of these whenever the value it is
+/// given is anything other than `true`, so `disabled: false` enables a button.
+const BOOLEAN_ATTRIBUTES: [&str; 27] = [
+    "allowfullscreen",
+    "allowpaymentrequest",
+    "async",
+    "autofocus",
+    "autoplay",
+    "checked",
+    "controls",
+    "default",
+    "defer",
+    "disabled",
+    "formnovalidate",
+    "hidden",
+    "ismap",
+    "itemscope",
+    "loop",
+    "multiple",
+    "muted",
+    "nomodule",
+    "novalidate",
+    "open",
+    "playsinline",
+    "readonly",
+    "required",
+    "reversed",
+    "selected",
+    "truespeed",
+    "webkitdirectory",
+];
+
+/// Whether an attribute should be left off the element, as the web
+/// interpreter leaves it off, instead of being written with its value.
+fn is_absent_boolean_attribute(local_name: &str, ns: Option<&str>, value: &str) -> bool {
+    ns.is_none() && value != "true" && BOOLEAN_ATTRIBUTES.contains(&local_name)
+}
+
 fn set_attribute_inner(
     docm: &mut DocumentMutator<'_>,
     local_name: &'static str,
     ns: Option<&'static str>,
     value: Option<&str>,
-    is_falsy: bool,
     node_id: NodeId,
 ) {
     trace!("set_attribute node_id:{node_id} ns: {ns:?} name:{local_name}, value:{value:?}");
@@ -381,13 +407,172 @@ fn set_attribute_inner(
     match value {
         None => docm.clear_attribute(node_id, name),
         Some(value) => {
-            if local_name == "checked" && is_falsy {
+            if is_absent_boolean_attribute(local_name, ns, value) {
                 docm.clear_attribute(node_id, name);
             } else if local_name == "dangerous_inner_html" {
                 docm.set_inner_html(node_id, value);
             } else {
                 docm.set_attribute(node_id, name, value);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use blitz_dom::{Document as _, LocalName};
+    use dioxus::prelude::*;
+
+    use super::{BOOLEAN_ATTRIBUTES, is_absent_boolean_attribute};
+    use crate::{DioxusDocument, DocumentConfig};
+
+    fn built(app: fn() -> Element) -> DioxusDocument {
+        let mut document = DioxusDocument::new(VirtualDom::new(app), DocumentConfig::default());
+        document.initial_build();
+        document
+    }
+
+    fn attribute(document: &DioxusDocument, id: &str, name: &str) -> Option<String> {
+        let inner = document.inner.borrow();
+        let node_id = inner
+            .get_element_by_id(id)
+            .unwrap_or_else(|| panic!("The element #{id} should exist."));
+        inner
+            .get_node(node_id)
+            .expect("An element found by its id has a node.")
+            .attr(LocalName::from(name))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn false_boolean_attributes_are_left_off_the_element() {
+        fn app() -> Element {
+            let off = false;
+            let on = true;
+            rsx! {
+                button { id: "dynamic-off", disabled: off }
+                button { id: "dynamic-on", disabled: on }
+                button { id: "static-off", disabled: false }
+                button { id: "static-on", disabled: true }
+                div { id: "hidden-off", hidden: off }
+                input { id: "checked-off", r#type: "checkbox", checked: off }
+                input { id: "checked-on", r#type: "checkbox", checked: on }
+            }
+        }
+        let document = built(app);
+        assert_eq!(attribute(&document, "dynamic-off", "disabled"), None);
+        assert_eq!(
+            attribute(&document, "dynamic-on", "disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(attribute(&document, "static-off", "disabled"), None);
+        assert_eq!(
+            attribute(&document, "static-on", "disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(attribute(&document, "hidden-off", "hidden"), None);
+        assert_eq!(attribute(&document, "checked-off", "checked"), None);
+        assert_eq!(
+            attribute(&document, "checked-on", "checked").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn only_true_keeps_a_boolean_attribute_as_in_the_web_interpreter() {
+        fn app() -> Element {
+            let named = "hidden";
+            let one = 1;
+            rsx! {
+                div { id: "text-true", hidden: "true" }
+                div { id: "text-name", hidden: named }
+                div { id: "number", hidden: one }
+            }
+        }
+        let document = built(app);
+        assert_eq!(
+            attribute(&document, "text-true", "hidden").as_deref(),
+            Some("true")
+        );
+        assert_eq!(attribute(&document, "text-name", "hidden"), None);
+        assert_eq!(attribute(&document, "number", "hidden"), None);
+    }
+
+    #[test]
+    fn other_attributes_keep_a_false_value() {
+        fn app() -> Element {
+            let off = false;
+            rsx! {
+                div { id: "data", "data-flag": off }
+                div { id: "aria", aria_hidden: "false" }
+                input { id: "value", value: "false" }
+            }
+        }
+        let document = built(app);
+        assert_eq!(
+            attribute(&document, "data", "data-flag").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            attribute(&document, "aria", "aria-hidden").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            attribute(&document, "value", "value").as_deref(),
+            Some("false")
+        );
+    }
+
+    thread_local! {
+        static DISABLED: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
+    }
+
+    #[test]
+    fn a_boolean_attribute_follows_its_value_as_it_changes() {
+        fn app() -> Element {
+            let disabled = use_signal(|| true);
+            DISABLED.with(|shared| shared.set(Some(disabled)));
+            rsx! {
+                button { id: "toggle", disabled: disabled() }
+            }
+        }
+        let mut document = built(app);
+        let mut disabled = DISABLED
+            .with(Cell::get)
+            .expect("The component shares its signal when it first renders.");
+        assert_eq!(
+            attribute(&document, "toggle", "disabled").as_deref(),
+            Some("true")
+        );
+
+        document.vdom.in_runtime(|| disabled.set(false));
+        assert!(document.poll(None));
+        assert_eq!(attribute(&document, "toggle", "disabled"), None);
+
+        document.vdom.in_runtime(|| disabled.set(true));
+        assert!(document.poll(None));
+        assert_eq!(
+            attribute(&document, "toggle", "disabled").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn the_absence_rule_covers_every_listed_attribute_and_nothing_namespaced() {
+        for name in BOOLEAN_ATTRIBUTES {
+            assert!(is_absent_boolean_attribute(name, None, "false"));
+            assert!(is_absent_boolean_attribute(name, None, ""));
+            assert!(!is_absent_boolean_attribute(name, None, "true"));
+            assert!(!is_absent_boolean_attribute(
+                name,
+                Some("http://www.w3.org/2000/svg"),
+                "false"
+            ));
+        }
+        for name in ["value", "class", "aria-hidden", "data-flag", "draggable"] {
+            assert!(!is_absent_boolean_attribute(name, None, "false"));
         }
     }
 }
