@@ -45,13 +45,13 @@ impl DioxusState {
         self.node_id_mapping.get(element_id.0).copied().flatten()
     }
 
-    pub(crate) fn anchor_and_nodes(&mut self, id: ElementId, m: usize) -> (usize, Vec<usize>) {
+    pub(crate) fn anchor_and_nodes(&mut self, id: ElementId, m: usize) -> (NodeId, Vec<NodeId>) {
         let anchor_node_id = self.element_to_node_id(id);
         let new_nodes = self.m_stack_nodes(m);
         (anchor_node_id, new_nodes)
     }
 
-    pub(crate) fn m_stack_nodes(&mut self, m: usize) -> Vec<usize> {
+    pub(crate) fn m_stack_nodes(&mut self, m: usize) -> Vec<NodeId> {
         self.stack.split_off(self.stack.len() - m)
     }
 
@@ -120,7 +120,7 @@ impl WriteMutations for MutationWriter<'_> {
 
     fn create_placeholder(&mut self, id: ElementId) {
         trace!("create_placeholder id:{}", id.0);
-        let node_id = self.docm.create_comment_node();
+        let node_id = self.docm.create_comment_node("placeholder");
         self.map_new_node(node_id, id);
     }
 
@@ -351,7 +351,7 @@ fn create_template_node(docm: &mut DocumentMutator<'_>, node: &TemplateNode) -> 
             node_id
         }
         TemplateNode::Text { text } => docm.create_text_node(text),
-        TemplateNode::Dynamic { .. } => docm.create_comment_node(),
+        TemplateNode::Dynamic { .. } => docm.create_comment_node("placeholder"),
     }
 }
 
