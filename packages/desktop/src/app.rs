@@ -41,11 +41,13 @@ pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
 /// How long between attempts once the quick ones are spent.
 pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
 
-/// How soon after a page is asked for a report of a page loaded can only be
-/// the page being replaced. A load takes the platform at least a second when
-/// the process is already up; a page that reports in within this of the
-/// asking finished loading before the asking, and the load just asked for is
-/// about to take its place. The wait goes on past such a report.
+/// How soon after a page is asked for again a report of a page loaded is
+/// taken to be an earlier attempt's page, which the load just asked for is
+/// about to replace. The wait goes on past such a report. Only a retry can
+/// have an earlier attempt's page still loading: the first load after a loss
+/// follows a page whose process has ended, so whatever reports in then is
+/// the new page, however quickly it came. A telephone that keeps a renderer
+/// ready loads the page in well under this.
 pub(crate) const PAGE_REPORT_TOO_SOON: Duration = Duration::from_millis(400);
 
 /// How many times a load that has begun is given another period of patience
@@ -73,9 +75,48 @@ pub(crate) struct PendingReload {
     pub(crate) asked_at: std::time::Instant,
 }
 
+impl PendingReload {
+    pub(crate) fn is_an_earlier_attempts_page(&self, since_asked: Duration) -> bool {
+        self.attempt > 1 && !self.deferred && since_asked < PAGE_REPORT_TOO_SOON
+    }
+}
+
 #[cfg(test)]
 mod reload_tests {
     use super::*;
+
+    fn pending(attempt: u32, deferred: bool) -> PendingReload {
+        PendingReload {
+            loss: 1,
+            attempt,
+            begun_waits: 0,
+            deferred,
+            asked_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn the_first_page_after_a_loss_is_the_new_page_however_soon_it_reports_in() {
+        assert!(
+            !pending(1, false).is_an_earlier_attempts_page(Duration::from_millis(15)),
+            "A page whose process ended cannot report in, so the first report is the new page."
+        );
+        assert!(!pending(1, false).is_an_earlier_attempts_page(Duration::from_millis(159)));
+    }
+
+    #[test]
+    fn a_report_just_after_a_retry_is_taken_for_the_page_it_replaces() {
+        assert!(pending(2, false).is_an_earlier_attempts_page(Duration::from_millis(20)));
+        assert!(pending(6, false).is_an_earlier_attempts_page(Duration::from_millis(399)));
+        assert!(
+            !pending(2, false).is_an_earlier_attempts_page(PAGE_REPORT_TOO_SOON),
+            "A report that comes a while after the retry is the retry's own page."
+        );
+        assert!(
+            !pending(2, true).is_an_earlier_attempts_page(Duration::from_millis(20)),
+            "A load that waited for the window to come back is taken as the page, as it always was."
+        );
+    }
 
     #[test]
     fn the_quick_attempts_are_quick_and_the_rest_are_slow_and_never_stop() {
@@ -585,7 +626,7 @@ impl App {
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
         if let Some(pending) = self.pending_reloads.get(&id).copied() {
             let since_asked = pending.asked_at.elapsed();
-            if since_asked < PAGE_REPORT_TOO_SOON && !pending.deferred {
+            if pending.is_an_earlier_attempts_page(since_asked) {
                 tracing::warn!(
                     "A page reported in {since_asked:?} after the page was asked for again, so it \
                      is the page being replaced; it is drawn into, and the wait for the one \
