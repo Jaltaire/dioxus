@@ -51,6 +51,27 @@ impl DioxusNativeWindowRenderer {
         Self::with_inner_renderer(vello_renderer)
     }
 
+    /// A renderer that paints nothing behind the document when `background`
+    /// is transparent, and composites the window's pixels with their alpha.
+    #[cfg(all(
+        feature = "vello-hybrid",
+        not(any(feature = "vello", feature = "vello-cpu-base", feature = "skia"))
+    ))]
+    pub(crate) fn for_background(
+        features: Option<Features>,
+        limits: Option<Limits>,
+        background: crate::config::Background,
+    ) -> Self {
+        let mut options = InnerRendererOptions::default();
+        options.features = features;
+        options.limits = limits;
+        if background == crate::config::Background::Transparent {
+            options.base_color = peniko::Color::TRANSPARENT;
+            options.composite_alpha_mode = anyrender::CompositeAlphaMode::Transparent;
+        }
+        Self::with_inner_renderer(InnerRenderer::with_options(options))
+    }
+
     fn with_inner_renderer(vello_renderer: InnerRenderer) -> Self {
         Self {
             inner: Rc::new(RefCell::new(vello_renderer)),

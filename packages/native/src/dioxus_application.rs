@@ -33,7 +33,7 @@ pub enum DioxusNativeEvent {
 }
 
 pub struct DioxusNativeApplication {
-    pending_window: Option<WindowConfig<DioxusNativeWindowRenderer>>,
+    pending_windows: Vec<WindowConfig<DioxusNativeWindowRenderer>>,
     inner: BlitzApplication<DioxusNativeWindowRenderer>,
     event_handlers: Rc<WindowEventHandlers>,
 }
@@ -44,8 +44,19 @@ impl DioxusNativeApplication {
         event_queue: std::sync::mpsc::Receiver<BlitzShellEvent>,
         config: WindowConfig<DioxusNativeWindowRenderer>,
     ) -> Self {
+        Self::with_windows(proxy, event_queue, vec![config])
+    }
+
+    /// An application that opens every one of `configs` as a Dioxus window
+    /// when it can first create surfaces, each with the contexts a Dioxus
+    /// window's components expect.
+    pub fn with_windows(
+        proxy: BlitzShellProxy,
+        event_queue: std::sync::mpsc::Receiver<BlitzShellEvent>,
+        configs: Vec<WindowConfig<DioxusNativeWindowRenderer>>,
+    ) -> Self {
         Self {
-            pending_window: Some(config),
+            pending_windows: configs,
             inner: BlitzApplication::new(proxy, event_queue),
             event_handlers: Rc::new(WindowEventHandlers::default()),
         }
@@ -53,6 +64,57 @@ impl DioxusNativeApplication {
 
     pub fn add_window(&mut self, window_config: WindowConfig<DioxusNativeWindowRenderer>) {
         self.inner.add_window(window_config);
+    }
+
+    /// Open one Dioxus window: give its components the document, event
+    /// handlers, history, renderer, and winit window they consume, build its
+    /// virtual dom, and ask for its first frame.
+    fn open_window(
+        &mut self,
+        config: WindowConfig<DioxusNativeWindowRenderer>,
+        event_loop: &dyn ActiveEventLoop,
+    ) {
+        let mut window = View::init(config, event_loop, &self.inner.proxy);
+        let winit_window = Arc::clone(&window.window);
+        let renderer = window.renderer.clone();
+        let window_id = window.window_id();
+        let doc = window.downcast_doc_mut::<DioxusDocument>();
+
+        doc.vdom.in_scope(ScopeId::ROOT, || {
+            let shared: Rc<dyn dioxus_document::Document> = Rc::new(DioxusNativeDocument::new(
+                self.inner.proxy.clone(),
+                window_id,
+            ));
+            provide_context(shared);
+            provide_context(self.event_handlers.clone());
+        });
+
+        // Add shell provider
+        let shell_provider = doc.inner.borrow().shell_provider.clone();
+        doc.vdom
+            .in_scope(ScopeId::ROOT, move || provide_context(shell_provider));
+
+        // Add history
+        let history_provider: Rc<dyn History> = Rc::new(MemoryHistory::default());
+        doc.vdom
+            .in_scope(ScopeId::ROOT, move || provide_context(history_provider));
+
+        // Add renderer
+        doc.vdom
+            .in_scope(ScopeId::ROOT, move || provide_context(renderer));
+
+        // Add winit window
+        doc.vdom
+            .in_scope(ScopeId::ROOT, move || provide_context(winit_window));
+
+        // Queue rebuild
+        doc.initial_build();
+
+        // And then request redraw
+        window.request_redraw();
+
+        // todo(jon): we should actually mess with the pending windows instead of passing along the contexts
+        self.inner.windows.insert(window_id, window);
     }
 
     fn handle_dioxus_native_event(
@@ -137,48 +199,8 @@ impl ApplicationHandler for DioxusNativeApplication {
         #[cfg(feature = "tracing")]
         tracing::debug!("Injecting document provider into all windows");
 
-        if let Some(config) = self.pending_window.take() {
-            let mut window = View::init(config, event_loop, &self.inner.proxy);
-            let winit_window = Arc::clone(&window.window);
-            let renderer = window.renderer.clone();
-            let window_id = window.window_id();
-            let doc = window.downcast_doc_mut::<DioxusDocument>();
-
-            doc.vdom.in_scope(ScopeId::ROOT, || {
-                let shared: Rc<dyn dioxus_document::Document> = Rc::new(DioxusNativeDocument::new(
-                    self.inner.proxy.clone(),
-                    window_id,
-                ));
-                provide_context(shared);
-                provide_context(self.event_handlers.clone());
-            });
-
-            // Add shell provider
-            let shell_provider = doc.inner.borrow().shell_provider.clone();
-            doc.vdom
-                .in_scope(ScopeId::ROOT, move || provide_context(shell_provider));
-
-            // Add history
-            let history_provider: Rc<dyn History> = Rc::new(MemoryHistory::default());
-            doc.vdom
-                .in_scope(ScopeId::ROOT, move || provide_context(history_provider));
-
-            // Add renderer
-            doc.vdom
-                .in_scope(ScopeId::ROOT, move || provide_context(renderer));
-
-            // Add winit window
-            doc.vdom
-                .in_scope(ScopeId::ROOT, move || provide_context(winit_window));
-
-            // Queue rebuild
-            doc.initial_build();
-
-            // And then request redraw
-            window.request_redraw();
-
-            // todo(jon): we should actually mess with the pending windows instead of passing along the contexts
-            self.inner.windows.insert(window_id, window);
+        for config in std::mem::take(&mut self.pending_windows) {
+            self.open_window(config, event_loop);
         }
 
         self.inner.can_create_surfaces(event_loop);

@@ -32,7 +32,7 @@ data-uri = ["blitz-shell/data-uri"]
 
 # Renderer features
 vello = ["dep:anyrender_vello", "dep:wgpu_context"]
-vello-hybrid = ["dep:anyrender_vello_hybrid", "dep:wgpu_context"]
+vello-hybrid = ["dep:anyrender_vello_hybrid", "dep:wgpu_context", "dep:peniko"]
 skia = ["dep:anyrender_skia"]
 vello-cpu = ["vello-cpu-pixels"]
 vello-cpu-pixels = ["vello-cpu-base", "anyrender_vello_cpu/pixels_window_renderer"]
@@ -79,6 +79,7 @@ anyrender_vello_hybrid = { workspace = true, optional = true}
 anyrender_vello_cpu = { workspace = true, optional = true}
 anyrender_skia = { workspace = true, optional = true}
 wgpu_context = { workspace = true, optional = true}
+peniko = { workspace = true, optional = true }
 
 # DioxusLabs dependencies
 dioxus-core = { workspace = true }

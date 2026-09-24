@@ -99,6 +99,27 @@ pub fn launch_cfg(
     launch_cfg_with_props(app, (), contexts, cfg)
 }
 
+/// A window for [`launch_windows`] to open when the application starts: the
+/// virtual dom that renders into it and the configuration it opens with.
+pub struct NativeWindow {
+    vdom: VirtualDom,
+    config: Config,
+}
+
+impl NativeWindow {
+    pub fn new(vdom: VirtualDom, config: Config) -> Self {
+        Self { vdom, config }
+    }
+}
+
+/// The renderer settings every window shares, read from a launch's configs.
+struct RendererSettings {
+    #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+    features: Option<Features>,
+    #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+    limits: Option<Limits>,
+}
+
 // todo: props shouldn't have the clone bound - should try and match dioxus-desktop behavior
 pub fn launch_cfg_with_props<P: Clone + 'static, M: 'static>(
     app: impl ComponentFunction<P, M>,
@@ -143,6 +164,68 @@ pub fn launch_cfg_with_props<P: Clone + 'static, M: 'static>(
     if let Some(window_attributes) = window_attributes {
         config.window_attributes = window_attributes;
     }
+
+    // Build the vdom first; the net provider, document, and other window-bound
+    // contexts are attached once the event-loop proxy exists.
+    let mut vdom = VirtualDom::new_with_props(app, props);
+
+    for context in contexts {
+        vdom.insert_any_root_context(context());
+    }
+
+    run_windows(
+        vec![NativeWindow::new(vdom, config)],
+        RendererSettings {
+            #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+            features,
+            #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+            limits,
+        },
+    );
+}
+
+/// Launch several windows at once, each rendering its own virtual dom, in one
+/// application and one event loop. Every window's components get the same
+/// contexts a window opened by [`launch_cfg`] gets. The configs are read for
+/// the renderer settings every window shares.
+pub fn launch_windows(windows: Vec<NativeWindow>, configs: Vec<Box<dyn Any>>) {
+    #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+    let (mut features, mut limits) = (None, None);
+    for cfg in configs {
+        #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+        let cfg = match cfg.downcast::<Features>() {
+            Ok(value) => {
+                features = Some(*value);
+                continue;
+            }
+            Err(cfg) => cfg,
+        };
+        #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+        let cfg = match cfg.downcast::<Limits>() {
+            Ok(value) => {
+                limits = Some(*value);
+                continue;
+            }
+            Err(cfg) => cfg,
+        };
+        let _ = cfg;
+    }
+    run_windows(
+        windows,
+        RendererSettings {
+            #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+            features,
+            #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
+            limits,
+        },
+    );
+}
+
+fn run_windows(windows: Vec<NativeWindow>, settings: RendererSettings) {
+    assert!(
+        !windows.is_empty(),
+        "Dioxus Native needs at least one window to launch."
+    );
     let event_loop = create_default_event_loop();
     let winit_proxy = event_loop.create_proxy();
     let (proxy, event_queue) = BlitzShellProxy::new(winit_proxy);
@@ -169,13 +252,26 @@ pub fn launch_cfg_with_props<P: Clone + 'static, M: 'static>(
         })
     }
 
-    // Build the vdom first; the net provider, document, and other window-bound
-    // contexts are attached below once the event-loop proxy exists.
-    let mut vdom = VirtualDom::new_with_props(app, props);
+    let configs = windows
+        .into_iter()
+        .map(|window| window_config(window, &proxy, &settings))
+        .collect();
 
-    for context in contexts {
-        vdom.insert_any_root_context(context());
-    }
+    // Create application
+    let application = DioxusNativeApplication::with_windows(proxy, event_queue, configs);
+
+    // Run event loop
+    event_loop.run_app(application).unwrap();
+}
+
+/// Attach the net, html parser, and navigation providers to one window's
+/// virtual dom, and pair its document with a renderer of its own.
+fn window_config(
+    window: NativeWindow,
+    proxy: &BlitzShellProxy,
+    settings: &RendererSettings,
+) -> WindowConfig<DioxusNativeWindowRenderer> {
+    let NativeWindow { vdom, config } = window;
 
     #[cfg(all(feature = "net", not(target_arch = "wasm32")))]
     let net_provider = {
@@ -216,19 +312,33 @@ pub fn launch_cfg_with_props<P: Clone + 'static, M: 'static>(
             ..Default::default()
         },
     );
-    #[cfg(any(feature = "vello", feature = "vello-hybrid"))]
-    let renderer = DioxusNativeWindowRenderer::with_features_and_limits(features, limits);
-    #[cfg(not(any(feature = "vello", feature = "vello-hybrid")))]
-    let renderer = DioxusNativeWindowRenderer::new();
-    let config = WindowConfig::with_attributes(
-        Box::new(doc) as _,
-        renderer.clone(),
-        config.window_attributes,
+    #[cfg(all(
+        feature = "vello-hybrid",
+        not(any(feature = "vello", feature = "vello-cpu-base", feature = "skia"))
+    ))]
+    let renderer = DioxusNativeWindowRenderer::for_background(
+        settings.features,
+        settings.limits.clone(),
+        config.background,
     );
-
-    // Create application
-    let application = DioxusNativeApplication::new(proxy, event_queue, config);
-
-    // Run event loop
-    event_loop.run_app(application).unwrap();
+    #[cfg(all(
+        any(feature = "vello", feature = "vello-hybrid"),
+        not(all(
+            feature = "vello-hybrid",
+            not(any(feature = "vello", feature = "vello-cpu-base", feature = "skia"))
+        ))
+    ))]
+    let renderer = {
+        let _ = config.background;
+        DioxusNativeWindowRenderer::with_features_and_limits(
+            settings.features,
+            settings.limits.clone(),
+        )
+    };
+    #[cfg(not(any(feature = "vello", feature = "vello-hybrid")))]
+    let renderer = {
+        let _ = (config.background, settings);
+        DioxusNativeWindowRenderer::new()
+    };
+    WindowConfig::with_attributes(Box::new(doc) as _, renderer, config.window_attributes)
 }
