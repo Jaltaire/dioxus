@@ -1,5 +1,5 @@
 use crate::bundler::{AppCategory, Bundle, BundleContext, copy_dir_recursive};
-use crate::{MacOsSettings, PackageType};
+use crate::{DioxusConfig, MacOsSettings, ManifestMapper, PackageType};
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ImageReader};
 use std::fs::{self, File};
@@ -551,8 +551,95 @@ impl BundleContext<'_> {
             let _ = provider;
         }
 
+        for (key, value) in declared_info_plist_entries(&self.build.config)? {
+            dict.insert(key, value);
+        }
+
         Ok(dict)
     }
+}
+
+fn declared_info_plist_entries(config: &DioxusConfig) -> Result<plist::Dictionary> {
+    let mapper = ManifestMapper::from_config(
+        &config.permissions,
+        &config.deep_links,
+        &config.background,
+        &config.android,
+        &config.ios,
+        &config.macos,
+    );
+    let mut entries = plist::Dictionary::new();
+    for entry in &mapper.macos_plist_entries {
+        entries.insert(entry.key.clone(), plist::Value::String(entry.value.clone()));
+    }
+    if !mapper.macos_url_schemes.is_empty() {
+        let mut url_type = plist::Dictionary::new();
+        url_type.insert(
+            "CFBundleURLSchemes".into(),
+            plist::Value::Array(
+                mapper
+                    .macos_url_schemes
+                    .iter()
+                    .map(|scheme| plist::Value::String(scheme.clone()))
+                    .collect(),
+            ),
+        );
+        entries.insert(
+            "CFBundleURLTypes".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(url_type)]),
+        );
+    }
+    for (key, value) in &config.macos.plist {
+        let value = property_list_value(value).with_context(|| {
+            format!("The Info.plist entry `{key}` cannot be written as a property list value.")
+        })?;
+        entries.insert(key.clone(), value);
+    }
+    if let Some(raw) = &config.macos.raw.info_plist {
+        let document = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>{raw}</dict></plist>"
+        );
+        let parsed = plist::Value::from_reader_xml(document.as_bytes())
+            .context("The raw Info.plist XML must be a run of dictionary keys and values.")?;
+        let plist::Value::Dictionary(raw_entries) = parsed else {
+            bail!("The raw Info.plist XML must be a run of dictionary keys and values.");
+        };
+        for (key, value) in raw_entries {
+            entries.insert(key, value);
+        }
+    }
+    Ok(entries)
+}
+
+fn property_list_value(value: &serde_json::Value) -> Result<plist::Value> {
+    Ok(match value {
+        serde_json::Value::Null => bail!("A property list has no null value."),
+        serde_json::Value::Bool(boolean) => plist::Value::Boolean(*boolean),
+        serde_json::Value::String(string) => plist::Value::String(string.clone()),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                plist::Value::Integer(integer.into())
+            } else if let Some(integer) = number.as_u64() {
+                plist::Value::Integer(integer.into())
+            } else if let Some(real) = number.as_f64() {
+                plist::Value::Real(real)
+            } else {
+                bail!("The number {number} has no property list form.");
+            }
+        }
+        serde_json::Value::Array(items) => plist::Value::Array(
+            items
+                .iter()
+                .map(property_list_value)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(fields) => plist::Value::Dictionary(
+            fields
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), property_list_value(value)?)))
+                .collect::<Result<plist::Dictionary>>()?,
+        ),
+    })
 }
 
 /// Add all appropriate size variants of an image to the ICNS family.
@@ -977,5 +1064,154 @@ impl Drop for TempKeychain {
         let _ = StdCommand::new("security")
             .args(["delete-keychain", &self.path.display().to_string()])
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared_info_plist_entries;
+    use crate::DioxusConfig;
+
+    fn entries(source: &str) -> plist::Dictionary {
+        let config: DioxusConfig = toml::from_str(source).expect("The config parses.");
+        declared_info_plist_entries(&config).expect("The declared entries convert.")
+    }
+
+    #[test]
+    fn a_config_that_declares_nothing_adds_nothing() {
+        assert!(entries("").is_empty());
+    }
+
+    #[test]
+    fn declared_plist_entries_keep_their_types() {
+        let declared = entries(
+            r#"
+            [macos.plist]
+            LSUIElement = true
+            NSAudioCaptureUsageDescription = "Audio is tapped to shift its pitch."
+            LSMinimumSystemVersion = "14.4"
+            NSCount = 3
+            NSRatio = 0.5
+            NSList = ["one", "two"]
+            NSTable = { inner = false }
+            "#,
+        );
+        assert_eq!(
+            declared.get("LSUIElement"),
+            Some(&plist::Value::Boolean(true))
+        );
+        assert_eq!(
+            declared.get("NSAudioCaptureUsageDescription"),
+            Some(&plist::Value::String(
+                "Audio is tapped to shift its pitch.".into()
+            ))
+        );
+        assert_eq!(
+            declared.get("NSCount"),
+            Some(&plist::Value::Integer(3.into()))
+        );
+        assert_eq!(declared.get("NSRatio"), Some(&plist::Value::Real(0.5)));
+        assert_eq!(
+            declared.get("NSList"),
+            Some(&plist::Value::Array(vec![
+                plist::Value::String("one".into()),
+                plist::Value::String("two".into()),
+            ]))
+        );
+        let table = declared
+            .get("NSTable")
+            .and_then(plist::Value::as_dictionary)
+            .expect("A table becomes a dictionary.");
+        assert_eq!(table.get("inner"), Some(&plist::Value::Boolean(false)));
+        assert_eq!(declared.len(), 7);
+    }
+
+    #[test]
+    fn permissions_and_url_schemes_become_their_info_plist_keys() {
+        let declared = entries(
+            r#"
+            [permissions.microphone]
+            description = "The microphone records dictation."
+
+            [deep_links]
+            schemes = ["example"]
+            "#,
+        );
+        assert_eq!(
+            declared.get("NSMicrophoneUsageDescription"),
+            Some(&plist::Value::String(
+                "The microphone records dictation.".into()
+            ))
+        );
+        let url_types = declared
+            .get("CFBundleURLTypes")
+            .and_then(plist::Value::as_array)
+            .expect("The schemes are declared as URL types.");
+        let schemes = url_types[0]
+            .as_dictionary()
+            .and_then(|url_type| url_type.get("CFBundleURLSchemes"))
+            .and_then(plist::Value::as_array)
+            .expect("The URL type lists its schemes.");
+        assert_eq!(schemes, &vec![plist::Value::String("example".into())]);
+    }
+
+    #[test]
+    fn raw_xml_is_read_as_dictionary_entries_and_wins_over_plist_entries() {
+        let declared = entries(
+            r#"
+            [macos.plist]
+            LSUIElement = true
+
+            [macos.raw]
+            info_plist = "<key>LSUIElement</key><false/><key>NSRaw</key><string>raw</string>"
+            "#,
+        );
+        assert_eq!(
+            declared.get("LSUIElement"),
+            Some(&plist::Value::Boolean(false))
+        );
+        assert_eq!(
+            declared.get("NSRaw"),
+            Some(&plist::Value::String("raw".into()))
+        );
+    }
+
+    #[test]
+    fn raw_xml_that_is_not_dictionary_entries_is_refused() {
+        let config: DioxusConfig = toml::from_str(
+            r#"
+            [macos.raw]
+            info_plist = "<key>Unclosed</key><string>"
+            "#,
+        )
+        .expect("The config parses.");
+        assert!(declared_info_plist_entries(&config).is_err());
+    }
+
+    #[test]
+    fn a_plist_entry_with_no_property_list_form_is_refused_by_key() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(["kept", null]),
+            serde_json::json!({ "inner": null }),
+        ] {
+            let mut config = DioxusConfig::default();
+            config.macos.plist.insert("NSNothing".into(), value.clone());
+            let error = declared_info_plist_entries(&config)
+                .expect_err("A null has no property list form.");
+            assert!(error.to_string().contains("NSNothing"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn integers_beyond_a_signed_integer_stay_integers() {
+        assert_eq!(
+            super::property_list_value(&serde_json::json!(u64::MAX)).unwrap(),
+            plist::Value::Integer(u64::MAX.into())
+        );
+        assert_eq!(
+            super::property_list_value(&serde_json::json!(-4)).unwrap(),
+            plist::Value::Integer((-4_i64).into())
+        );
     }
 }
