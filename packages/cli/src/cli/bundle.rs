@@ -110,15 +110,8 @@ impl Bundle {
                     destination.display()
                 );
 
-                if bundle_path.is_dir() {
-                    dircpy::CopyBuilder::new(&bundle_path, &destination)
-                        .overwrite(true)
-                        .run_par()
-                        .context("Failed to copy the app to output directory")?;
-                } else {
-                    std::fs::copy(&bundle_path, &destination)
-                        .context("Failed to copy the app to output directory")?;
-                }
+                replace_with_copy(bundle_path, &destination)
+                    .context("Failed to copy the app to output directory")?;
 
                 *bundle_path = destination;
             }
@@ -263,6 +256,24 @@ impl Bundle {
     }
 }
 
+fn replace_with_copy(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(existing) if existing.is_dir() => std::fs::remove_dir_all(destination)?,
+        Ok(_) => std::fs::remove_file(destination)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if source.is_dir() {
+        crate::bundler::copy_dir_recursive(source, destination)
+    } else {
+        std::fs::copy(source, destination)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Bundle;
@@ -362,5 +373,88 @@ mod tests {
             bundle.args.shared.build_arguments.target,
             Some("aarch64-apple-ios".parse().unwrap())
         );
+    }
+
+    #[cfg(unix)]
+    fn framework(root: &std::path::Path) -> std::path::PathBuf {
+        let app = root.join("Example.app");
+        let framework = app.join("Contents/Frameworks/Example.framework");
+        std::fs::create_dir_all(framework.join("Versions/A/Resources")).unwrap();
+        std::fs::write(framework.join("Versions/A/Example"), b"library").unwrap();
+        std::fs::write(framework.join("Versions/A/Resources/Info.plist"), b"plist").unwrap();
+        std::os::unix::fs::symlink("A", framework.join("Versions/Current")).unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Example", framework.join("Example")).unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Resources", framework.join("Resources"))
+            .unwrap();
+        app
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_bundle_keeps_its_framework_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = framework(temp.path());
+        let destination = temp.path().join("out/Example.app");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        super::replace_with_copy(&app, &destination).unwrap();
+
+        let copied = destination.join("Contents/Frameworks/Example.framework");
+        for (link, target) in [
+            ("Versions/Current", "A"),
+            ("Example", "Versions/Current/Example"),
+            ("Resources", "Versions/Current/Resources"),
+        ] {
+            let path = copied.join(link);
+            assert!(
+                std::fs::symlink_metadata(&path).unwrap().is_symlink(),
+                "{link} was not copied as a link."
+            );
+            assert_eq!(
+                std::fs::read_link(&path).unwrap(),
+                std::path::Path::new(target)
+            );
+        }
+        assert_eq!(std::fs::read(copied.join("Example")).unwrap(), b"library");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_bundle_replaces_what_was_there_before() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = framework(temp.path());
+        let destination = temp.path().join("out/Example.app");
+        std::fs::create_dir_all(destination.join("Contents")).unwrap();
+        std::fs::write(destination.join("Contents/stale"), b"stale").unwrap();
+
+        super::replace_with_copy(&app, &destination).unwrap();
+
+        assert!(!destination.join("Contents/stale").exists());
+        assert!(
+            destination
+                .join("Contents/Frameworks/Example.framework")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn a_copied_file_bundle_replaces_the_file_there_before() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Example.dmg");
+        std::fs::write(&source, b"new").unwrap();
+        let destination = temp.path().join("out.dmg");
+        std::fs::write(&destination, b"old").unwrap();
+
+        super::replace_with_copy(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_copy_into_a_missing_folder_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Example.dmg");
+        std::fs::write(&source, b"new").unwrap();
+        assert!(super::replace_with_copy(&source, &temp.path().join("missing/out.dmg")).is_err());
     }
 }
