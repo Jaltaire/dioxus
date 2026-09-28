@@ -496,6 +496,11 @@ impl BuildRequest {
         // ie dioxus = { features = ["web"] } but also --platform desktop
         // anyways, we collect it here in the event we need it if platform is not specified.
         let dioxus_direct_renderer = Self::renderer_enabled_by_dioxus_dependency(main_package);
+        let direct_dependency_renderer = Self::renderer_enabled_by_direct_dependency(main_package);
+        let direct_native_renderer = direct_dependency_renderer
+            .as_ref()
+            .map(|(renderer, _)| *renderer)
+            .filter(|renderer| matches!(renderer, Renderer::Native));
         let known_features_as_renderers = Self::features_that_enable_renderers(main_package);
 
         // The crate might enable multiple platforms or no platforms at
@@ -548,7 +553,8 @@ impl BuildRequest {
                     } else {
                         None
                     }
-                });
+                })
+                .or_else(|| direct_dependency_renderer.clone());
 
             if let Some((direct, feature)) = auto {
                 match direct {
@@ -588,6 +594,7 @@ impl BuildRequest {
                 triple = triple.or(Some("wasm32-unknown-unknown".parse()?));
             }
             Platform::MacOS => {
+                renderer = renderer.or(direct_native_renderer);
                 if main_package.features.contains_key("desktop") && renderer.is_none() {
                     features.push("desktop".into());
                 }
@@ -596,6 +603,7 @@ impl BuildRequest {
                 triple = triple.or(Some(Triple::host()));
             }
             Platform::Windows => {
+                renderer = renderer.or(direct_native_renderer);
                 if main_package.features.contains_key("desktop") && renderer.is_none() {
                     features.push("desktop".into());
                 }
@@ -604,6 +612,7 @@ impl BuildRequest {
                 triple = triple.or(Some(Triple::host()));
             }
             Platform::Linux => {
+                renderer = renderer.or(direct_native_renderer);
                 if main_package.features.contains_key("desktop") && renderer.is_none() {
                     features.push("desktop".into());
                 }
@@ -612,6 +621,7 @@ impl BuildRequest {
                 triple = triple.or(Some(Triple::host()));
             }
             Platform::Ios => {
+                renderer = renderer.or(direct_native_renderer);
                 if main_package.features.contains_key("mobile") && renderer.is_none() {
                     features.push("mobile".into());
                 }
@@ -631,6 +641,7 @@ impl BuildRequest {
                 }
             }
             Platform::Android => {
+                renderer = renderer.or(direct_native_renderer);
                 if main_package.features.contains_key("mobile") && renderer.is_none() {
                     features.push("mobile".into());
                 }

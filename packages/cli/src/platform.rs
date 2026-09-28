@@ -185,6 +185,18 @@ impl Renderer {
         }
     }
 
+    /// The crate that carries the renderer, for an application that depends on it directly
+    /// rather than through a feature of `dioxus`.
+    pub(crate) fn renderer_crate(&self) -> Option<&'static str> {
+        match self {
+            Renderer::Webview => Some("dioxus-desktop"),
+            Renderer::Native => Some("dioxus-native"),
+            Renderer::Web => Some("dioxus-web"),
+            Renderer::Liveview => Some("dioxus-liveview"),
+            Renderer::Server => None,
+        }
+    }
+
     pub(crate) fn autodetect_from_cargo_feature(feature: &str) -> Option<Self> {
         match feature {
             "web" => Some(Self::Web),

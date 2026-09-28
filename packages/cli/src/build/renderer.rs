@@ -29,6 +29,36 @@ impl BuildRequest {
         Some(renderers[0].clone())
     }
 
+    /// Discover the renderer from a renderer crate the package depends on directly, as an
+    /// application that launches through `dioxus_native::launch` does.
+    pub(crate) fn renderer_enabled_by_direct_dependency(
+        package: &krates::cm::Package,
+    ) -> Option<(Renderer, String)> {
+        let renderers: Vec<(Renderer, String)> = [
+            Renderer::Webview,
+            Renderer::Native,
+            Renderer::Web,
+            Renderer::Liveview,
+        ]
+        .into_iter()
+        .filter_map(|renderer| {
+            let name = renderer.renderer_crate()?;
+            Self::depends_directly_on(package, name).then(|| (renderer, name.to_string()))
+        })
+        .collect();
+
+        match renderers.as_slice() {
+            [renderer] => Some(renderer.clone()),
+            _ => None,
+        }
+    }
+
+    fn depends_directly_on(package: &krates::cm::Package, name: &str) -> bool {
+        package.dependencies.iter().any(|dependency| {
+            dependency.name == name && matches!(dependency.kind, krates::cm::DependencyKind::Normal)
+        })
+    }
+
     pub(crate) fn features_that_enable_renderers(
         package: &krates::cm::Package,
     ) -> Vec<(Renderer, String)> {
@@ -186,6 +216,14 @@ impl BuildRequest {
         });
 
         res.or_else(|| {
+            if let Some(name) = renderer.renderer_crate()
+                && Self::depends_directly_on(package, name)
+            {
+                tracing::debug!(
+                    "The package depends on {name} directly, so no dioxus feature is added for renderer {renderer}"
+                );
+                return None;
+            }
             let depends_on_dioxus = package.dependencies.iter().any(|dep| dep.name == "dioxus");
             if depends_on_dioxus {
                 let fallback = format!("dioxus/{dioxus_feature}");
@@ -197,5 +235,151 @@ impl BuildRequest {
                 None
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{BuildRequest, Renderer};
+
+    fn package(
+        dependencies: &[(&str, Option<&str>)],
+        features: serde_json::Value,
+    ) -> krates::cm::Package {
+        let dependencies: Vec<serde_json::Value> = dependencies
+            .iter()
+            .map(|(name, kind)| {
+                serde_json::json!({
+                    "name": name,
+                    "req": "*",
+                    "kind": kind,
+                    "optional": false,
+                    "uses_default_features": true,
+                    "features": [],
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "name": "example",
+            "version": "0.1.0",
+            "id": "example 0.1.0 (path+file:///example)",
+            "dependencies": dependencies,
+            "targets": [],
+            "features": features,
+            "manifest_path": "/example/Cargo.toml",
+        }))
+        .expect("The package description parses.")
+    }
+
+    fn host() -> target_lexicon::Triple {
+        "aarch64-apple-darwin".parse().unwrap()
+    }
+
+    #[test]
+    fn a_direct_renderer_crate_names_the_renderer() {
+        for (name, renderer) in [
+            ("dioxus-native", Renderer::Native),
+            ("dioxus-desktop", Renderer::Webview),
+            ("dioxus-web", Renderer::Web),
+            ("dioxus-liveview", Renderer::Liveview),
+        ] {
+            let package = package(&[("dioxus", None), (name, None)], serde_json::json!({}));
+            assert_eq!(
+                BuildRequest::renderer_enabled_by_direct_dependency(&package),
+                Some((renderer, name.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn no_renderer_is_named_by_none_or_by_two_renderer_crates() {
+        let none = package(&[("dioxus", None)], serde_json::json!({}));
+        assert_eq!(
+            BuildRequest::renderer_enabled_by_direct_dependency(&none),
+            None
+        );
+        let two = package(
+            &[("dioxus-native", None), ("dioxus-desktop", None)],
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            BuildRequest::renderer_enabled_by_direct_dependency(&two),
+            None
+        );
+    }
+
+    #[test]
+    fn a_renderer_crate_needed_only_by_tests_or_the_build_names_nothing() {
+        for kind in ["dev", "build"] {
+            let package = package(&[("dioxus-native", Some(kind))], serde_json::json!({}));
+            assert_eq!(
+                BuildRequest::renderer_enabled_by_direct_dependency(&package),
+                None,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_that_depends_on_the_renderer_crate_gets_no_dioxus_feature() {
+        let package = package(
+            &[("dioxus", None), ("dioxus-native", None)],
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            BuildRequest::feature_for_platform_and_renderer(&package, &host(), Renderer::Native),
+            None
+        );
+    }
+
+    #[test]
+    fn a_package_without_the_renderer_crate_still_gets_the_dioxus_feature() {
+        let package = package(&[("dioxus", None)], serde_json::json!({}));
+        assert_eq!(
+            BuildRequest::feature_for_platform_and_renderer(&package, &host(), Renderer::Native),
+            Some("dioxus/native".to_string())
+        );
+        let desktop_only = package_with_desktop_crate();
+        assert_eq!(
+            BuildRequest::feature_for_platform_and_renderer(
+                &desktop_only,
+                &host(),
+                Renderer::Native
+            ),
+            Some("dioxus/native".to_string())
+        );
+    }
+
+    fn package_with_desktop_crate() -> krates::cm::Package {
+        package(
+            &[("dioxus", None), ("dioxus-desktop", None)],
+            serde_json::json!({}),
+        )
+    }
+
+    #[test]
+    fn the_package_s_own_renderer_feature_wins_over_the_direct_crate() {
+        let package = package(
+            &[("dioxus", None), ("dioxus-desktop", None)],
+            serde_json::json!({ "desktop": ["dioxus/desktop"], "mobile": ["dioxus/mobile"] }),
+        );
+        assert_eq!(
+            BuildRequest::feature_for_platform_and_renderer(&package, &host(), Renderer::Webview),
+            Some("desktop".to_string())
+        );
+        let ios: target_lexicon::Triple = "aarch64-apple-ios".parse().unwrap();
+        assert_eq!(
+            BuildRequest::feature_for_platform_and_renderer(&package, &ios, Renderer::Webview),
+            Some("mobile".to_string())
+        );
+    }
+
+    #[test]
+    fn every_renderer_but_the_server_has_a_crate() {
+        assert_eq!(Renderer::Native.renderer_crate(), Some("dioxus-native"));
+        assert_eq!(Renderer::Webview.renderer_crate(), Some("dioxus-desktop"));
+        assert_eq!(Renderer::Web.renderer_crate(), Some("dioxus-web"));
+        assert_eq!(Renderer::Liveview.renderer_crate(), Some("dioxus-liveview"));
+        assert_eq!(Renderer::Server.renderer_crate(), None);
     }
 }
