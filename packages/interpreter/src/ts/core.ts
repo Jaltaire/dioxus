@@ -148,6 +148,22 @@ export class BaseInterpreter {
     }
   }
 
+  listensOnPath(target: EventTarget | null, event_name: string): boolean {
+    let node = target instanceof Node ? target : null;
+    while (node) {
+      const listening = (node as Node & { dioxusBubbling?: BubblingListeners })
+        .dioxusBubbling;
+      if (listening && listening[event_name]) {
+        return true;
+      }
+      if (node === this.root) {
+        return false;
+      }
+      node = node.parentNode;
+    }
+    return false;
+  }
+
   removeBubblingListener(event_name: string) {
     this.global[event_name].active--;
     if (this.global[event_name].active === 0) {
@@ -331,32 +347,12 @@ export class BaseInterpreter {
   }
 }
 
-export type BubblingListeners = { [event_name: string]: number };
+type BubblingListeners = { [event_name: string]: number };
 
-export function bubblingListeners(element: Node): BubblingListeners {
+function bubblingListeners(element: Node): BubblingListeners {
   const node = element as Node & { dioxusBubbling?: BubblingListeners };
   if (!node.dioxusBubbling) {
     node.dioxusBubbling = {};
   }
   return node.dioxusBubbling;
-}
-
-export function listensOnPath(
-  target: EventTarget | null,
-  root: Node,
-  event_name: string
-): boolean {
-  let node = target instanceof Node ? target : null;
-  while (node) {
-    const listening = (node as Node & { dioxusBubbling?: BubblingListeners })
-      .dioxusBubbling;
-    if (listening && listening[event_name]) {
-      return true;
-    }
-    if (node === root) {
-      return false;
-    }
-    node = node.parentNode;
-  }
-  return false;
 }

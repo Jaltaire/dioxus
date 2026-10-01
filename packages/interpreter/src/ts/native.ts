@@ -3,7 +3,7 @@
 // This file lives on the renderer, not the host. It's basically a polyfill over functionality that the host can't
 // provide since it doesn't have access to the dom.
 
-import { BaseInterpreter, NodeId, listensOnPath } from "./core";
+import { BaseInterpreter, NodeId } from "./core";
 import { SerializedEvent, serializeEvent, SerializedFileData, extractSerializedFormValues, SerializedFormObject } from "./serialize";
 
 // okay so, we've got this JSChannel thing from sledgehammer, implicitly imported into our scope
@@ -353,7 +353,7 @@ export class NativeInterpreter extends JSChannel_ {
   handleEvent(event: Event, name: string, bubbles: boolean) {
     const target = event.target!;
 
-    if (bubbles && !listensOnPath(target, this.root, name)) {
+    if (bubbles && !this.listensOnPath(target, name)) {
       if (target instanceof Element && event.type === "click") {
         this.handleClickNavigate(event, target);
       }
