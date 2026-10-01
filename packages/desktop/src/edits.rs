@@ -643,6 +643,12 @@ mod connection_tests {
         server.send_edits(webview, edits.to_vec())
     }
 
+    const TEMPLATE: dioxus_core::Template = dioxus_core::Template::new(
+        &[dioxus_core::TemplateNode::Text { text: "kept" }],
+        &[],
+        &[],
+    );
+
     fn receive(websocket: &mut tungstenite::WebSocket<TcpStream>) -> Vec<u8> {
         loop {
             if let tungstenite::Message::Binary(edits) = websocket.read().unwrap() {
@@ -704,6 +710,14 @@ mod connection_tests {
 
         // The virtual dom renders while the page is awaited: a diff against the
         // page that is gone. Nothing of it may reach the table.
+        queue.with_mutation_state_mut(|state| {
+            dioxus_core::WriteMutations::load_template(
+                state,
+                TEMPLATE,
+                0,
+                dioxus_core::ElementId(2),
+            )
+        });
         queue.send_edits();
         assert!(matches!(
             server.connections.read().unwrap().get(&webview),
@@ -714,10 +728,34 @@ mod connection_tests {
         // The new page reports in: the templates start over and the rebuild
         // is the first batch the page will receive.
         queue.page_arrived();
+        let mut fresh = MutationState::default();
         assert_eq!(
-            queue.with_mutation_state_mut(|state| state.export_memory()),
-            MutationState::default().export_memory(),
+            queue
+                .with_mutation_state_mut(|state| state.export_memory())
+                .len(),
+            fresh.export_memory().len(),
             "The new page's edits state carries something of the old page's."
+        );
+        queue.with_mutation_state_mut(|state| {
+            dioxus_core::WriteMutations::load_template(
+                state,
+                TEMPLATE,
+                0,
+                dioxus_core::ElementId(2),
+            )
+        });
+        dioxus_core::WriteMutations::load_template(
+            &mut fresh,
+            TEMPLATE,
+            0,
+            dioxus_core::ElementId(2),
+        );
+        assert_eq!(
+            queue
+                .with_mutation_state_mut(|state| state.export_memory())
+                .len(),
+            fresh.export_memory().len(),
+            "The new page was not sent a template rendered while it was awaited."
         );
         queue.send_edits();
         assert!(matches!(
