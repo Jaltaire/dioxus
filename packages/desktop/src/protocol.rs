@@ -12,14 +12,49 @@ use wry::{
     http::{Request, Response, status::StatusCode},
 };
 
-#[cfg(target_os = "android")]
-const BASE_URI: &str = "https://dioxus.index.html/";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageAddress {
+    CustomScheme,
+    Http,
+    Https,
+}
 
-#[cfg(target_os = "windows")]
-const BASE_URI: &str = "http://dioxus.index.html/";
+impl PageAddress {
+    #[cfg(target_os = "android")]
+    pub(crate) const THIS_PLATFORM: Self = Self::Https;
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
-const BASE_URI: &str = "dioxus://index.html/";
+    #[cfg(target_os = "windows")]
+    pub(crate) const THIS_PLATFORM: Self = Self::Http;
+
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    pub(crate) const THIS_PLATFORM: Self = Self::CustomScheme;
+
+    pub(crate) const ALL: [Self; 3] = [Self::CustomScheme, Self::Http, Self::Https];
+
+    pub(crate) const fn index(self) -> &'static str {
+        match self {
+            Self::CustomScheme => "dioxus://index.html/",
+            Self::Http => "http://dioxus.index.html/",
+            Self::Https => "https://dioxus.index.html/",
+        }
+    }
+
+    const fn origin(self) -> &'static str {
+        match self {
+            Self::CustomScheme => "dioxus://",
+            Self::Http => "http://dioxus.",
+            Self::Https => "https://dioxus.",
+        }
+    }
+
+    pub(crate) fn serves(url: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|address| url.starts_with(address.origin()))
+    }
+}
+
+const BASE_URI: &str = PageAddress::THIS_PLATFORM.index();
 
 #[cfg(debug_assertions)]
 static DEFAULT_INDEX: &str = include_str!("./assets/dev.index.html");
@@ -272,4 +307,70 @@ fn respond_to_file_dialog(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod page_address_tests {
+    use super::PageAddress;
+
+    #[test]
+    fn every_address_of_the_page_is_one_the_navigation_guard_serves() {
+        for address in PageAddress::ALL {
+            assert!(
+                PageAddress::serves(address.index()),
+                "The guard refuses {address:?}'s {}.",
+                address.index()
+            );
+        }
+    }
+
+    #[test]
+    fn every_address_of_the_page_is_under_its_own_origin() {
+        for address in PageAddress::ALL {
+            assert!(address.index().starts_with(address.origin()));
+            for other in PageAddress::ALL
+                .into_iter()
+                .filter(|other| *other != address)
+            {
+                assert!(!address.index().starts_with(other.origin()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_navigation_guard_serves_nothing_but_the_page() {
+        for url in [
+            "https://example.com/",
+            "http://example.com/dioxus.index.html/",
+            "mailto:someone@example.com",
+            "about:blank",
+            "file:///index.html",
+        ] {
+            assert!(!PageAddress::serves(url), "The guard serves {url}.");
+        }
+    }
+
+    #[test]
+    fn the_http_addresses_are_the_custom_scheme_rewritten_as_wry_rewrites_it() {
+        let custom = PageAddress::CustomScheme.index();
+        assert_eq!(
+            PageAddress::Http.index(),
+            custom.replace("dioxus://", "http://dioxus.")
+        );
+        assert_eq!(
+            PageAddress::Https.index(),
+            custom.replace("dioxus://", "https://dioxus.")
+        );
+    }
+
+    #[test]
+    fn each_platform_asks_for_the_page_at_the_address_its_web_view_serves_it_from() {
+        #[cfg(target_os = "android")]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::Https);
+        #[cfg(target_os = "windows")]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::Http);
+        #[cfg(not(any(target_os = "android", target_os = "windows")))]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::CustomScheme);
+        assert_eq!(super::BASE_URI, PageAddress::THIS_PLATFORM.index());
+    }
 }

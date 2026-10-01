@@ -601,7 +601,7 @@ impl App {
         if let Err(error) = view
             .desktop_context
             .webview
-            .load_url("dioxus://index.html/")
+            .load_url(crate::protocol::PageAddress::THIS_PLATFORM.index())
         {
             tracing::error!(
                 "The page could not be loaded again after its web content process was \

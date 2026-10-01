@@ -4,7 +4,7 @@ use crate::menubar::DioxusMenu;
 use crate::{
     Config, DesktopContext, DesktopService, app::SharedContext, assets::AssetHandlerRegistry,
     edits::WryQueue, file_upload::NativeFileHover, ipc::UserWindowEvent, protocol,
-    waker::tao_waker,
+    protocol::PageAddress, waker::tao_waker,
 };
 use crate::{WeakDesktopContext, document::DesktopDocument};
 use crate::{element::DesktopElement, file_upload::DesktopFormData};
@@ -389,17 +389,14 @@ impl WebviewInstance {
                 )),
             })
             .with_transparent(cfg.window.window.transparent)
-            .with_url("dioxus://index.html/")
+            .with_url(PageAddress::CustomScheme.index())
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler({
                 let page_loaded = page_loaded.clone();
                 let page_awaited = page_awaited.clone();
                 move |var: String| {
                     // Serve the index and assets.
-                    if var.starts_with("dioxus://")
-                        || var.starts_with("http://dioxus.")
-                        || var.starts_with("https://dioxus.")
-                    {
+                    if PageAddress::serves(&var) {
                         // After the page has loaded once, don't allow any more navigation
                         let page_loaded =
                             page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
