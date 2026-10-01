@@ -78,3 +78,35 @@ test("onmounted", async ({ page }) => {
   const mountedDiv = page.locator("div.onmounted-div");
   await expect(mountedDiv).toHaveText("onmounted was called 1 times");
 });
+
+test("bubbling events round-trip only when an element on their path listens", async ({ page }) => {
+  await page.goto("http://127.0.0.1:3030");
+
+  const moved = page.locator("div.path-moved");
+  await expect(moved).toHaveText("moved 0 times");
+
+  await page.evaluate(() => {
+    const interpreter = window.interpreter;
+    const send = interpreter.sendIpcMessage.bind(interpreter);
+    window.sentEvents = [];
+    interpreter.sendIpcMessage = (method, params) => {
+      if (method === "user_event") {
+        window.sentEvents.push(params.name);
+      }
+      return send(method, params);
+    };
+  });
+  const moveOver = (selector) =>
+    page.evaluate((selector) => {
+      document
+        .querySelector(selector)
+        .dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true }));
+    }, selector);
+
+  await moveOver("div.path-quiet");
+  await moveOver("div.path-listening-child");
+
+  await expect(moved).toHaveText("moved 1 times");
+  const sent = await page.evaluate(() => window.sentEvents.filter((name) => name === "mousemove"));
+  expect(sent).toEqual(["mousemove"]);
+});
