@@ -457,6 +457,25 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtAndroid as _;
 
             webview = webview.with_https_scheme(true);
+
+            let page_loaded = page_loaded.clone();
+            let page_awaited = page_awaited.clone();
+            let (proxy, window_id) = (shared.proxy.to_owned(), window.id());
+            webview = webview.with_on_render_process_gone_handler(move |gone| {
+                match gone {
+                    wry::RenderProcessGone::Crashed => tracing::warn!(
+                        "The web view's renderer process crashed. The page will be loaded again so \
+                         the application can come back."
+                    ),
+                    wry::RenderProcessGone::Killed => tracing::warn!(
+                        "The web view's renderer process was ended by the system. The page will be \
+                         loaded again so the application can come back."
+                    ),
+                }
+                page_awaited.store(true, std::sync::atomic::Ordering::SeqCst);
+                page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+                _ = proxy.send_event(UserWindowEvent::PageLost(window_id));
+            });
         };
 
         // Disable the webview default shortcuts to disable the reload shortcut
