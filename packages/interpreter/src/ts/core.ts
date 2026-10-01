@@ -126,6 +126,8 @@ export class BaseInterpreter {
       } else {
         this.global[event_name].active++;
       }
+      const listening = bubblingListeners(element);
+      listening[event_name] = (listening[event_name] ?? 0) + 1;
     } else {
       const id = element.getAttribute("data-dioxus-id");
       if (!this.local[id]) {
@@ -141,6 +143,11 @@ export class BaseInterpreter {
     } else if (event_name == "visible") {
       this.removeIntersectionObserver(element);
     } else if (bubbles) {
+      const listening = bubblingListeners(element);
+      listening[event_name] = (listening[event_name] ?? 1) - 1;
+      if (listening[event_name] <= 0) {
+        delete listening[event_name];
+      }
       this.removeBubblingListener(event_name);
     } else {
       this.removeNonBubblingListener(element, event_name);
@@ -385,4 +392,34 @@ export class BaseInterpreter {
   ) {
     setAttributeInner(node as HTMLElement, field, value, ns ?? "");
   }
+}
+
+export type BubblingListeners = { [event_name: string]: number };
+
+export function bubblingListeners(element: Node): BubblingListeners {
+  const node = element as Node & { dioxusBubbling?: BubblingListeners };
+  if (!node.dioxusBubbling) {
+    node.dioxusBubbling = {};
+  }
+  return node.dioxusBubbling;
+}
+
+export function listensOnPath(
+  target: EventTarget | null,
+  root: Node,
+  event_name: string
+): boolean {
+  let node = target instanceof Node ? target : null;
+  while (node) {
+    const listening = (node as Node & { dioxusBubbling?: BubblingListeners })
+      .dioxusBubbling;
+    if (listening && listening[event_name]) {
+      return true;
+    }
+    if (node === root) {
+      return false;
+    }
+    node = node.parentNode;
+  }
+  return false;
 }

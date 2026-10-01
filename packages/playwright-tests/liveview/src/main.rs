@@ -21,6 +21,21 @@ fn app() -> Element {
         input { value: "hello input" }
         div { class: "style-div", color: "red", "colored text" }
         OnMounted {}
+        PathListeners {}
+    }
+}
+
+#[component]
+fn PathListeners() -> Element {
+    let mut moved = use_signal(|| 0);
+    rsx! {
+        div {
+            class: "path-listening-parent",
+            onmousemove: move |_| moved += 1,
+            div { class: "path-listening-child", "listening child" }
+        }
+        div { class: "path-quiet", "quiet" }
+        div { class: "path-moved", "moved {moved} times" }
     }
 }
 
