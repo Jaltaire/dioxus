@@ -1103,3 +1103,6 @@ doc-scrape-examples = true
 [[example]]
 name = "__scrape_example_list"
 path = "examples/scripts/scrape_examples.rs"
+
+[patch.crates-io]
+wry = { git = "https://github.com/Jaltaire/wry", branch = "main-jaltaire" }
