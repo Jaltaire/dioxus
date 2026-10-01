@@ -3,7 +3,7 @@ use crate::{
     app::SharedContext,
     assets::AssetHandlerRegistry,
     file_upload::NativeFileHover,
-    head_record::HeadRecord,
+    head_record::{HeadInsertion, HeadRecord},
     ipc::UserWindowEvent,
     query::QueryEngine,
     shortcut::{HotKey, HotKeyState, ShortcutHandle, ShortcutRegistryError},
@@ -232,8 +232,8 @@ impl DesktopService {
 
     /// Records a script that puts an element into the head, so that it can be
     /// put into a page that replaces this one.
-    pub(crate) fn remember_head_element(&self, js: String) {
-        self.head_elements.borrow_mut().remember(js);
+    pub(crate) fn remember_head_element(&self, js: String) -> HeadInsertion {
+        self.head_elements.borrow_mut().remember(js)
     }
 
     /// Puts every remembered head element into the page again.
@@ -242,7 +242,7 @@ impl DesktopService {
     /// were replaced before it. On a page that replaced nothing there is
     /// nothing remembered yet, so this does nothing.
     pub(crate) fn replay_head_elements(&self) {
-        let scripts = self.head_elements.borrow().scripts();
+        let scripts = self.head_elements.borrow_mut().replay();
         if scripts.is_empty() {
             return;
         }

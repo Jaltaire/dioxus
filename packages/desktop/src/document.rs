@@ -1,4 +1,4 @@
-use crate::{DesktopContext, WeakDesktopContext, query::Query};
+use crate::{DesktopContext, WeakDesktopContext, head_record::HeadInsertion, query::Query};
 use dioxus_core::queue_effect;
 use dioxus_document::{
     Document, Eval, EvalError, Evaluator, LinkProps, MetaProps, ScriptProps, StyleProps,
@@ -23,6 +23,21 @@ impl DesktopDocument {
     }
 }
 
+impl DesktopDocument {
+    fn put_in_head(&self, js: String) {
+        let insertion = match self.desktop_ctx.upgrade() {
+            Some(ctx) => ctx.remember_head_element(js.clone()),
+            None => HeadInsertion::PutIn,
+        };
+        match insertion {
+            HeadInsertion::PutIn => {
+                self.eval(js);
+            }
+            HeadInsertion::AlreadyInPage => {}
+        }
+    }
+}
+
 impl Document for DesktopDocument {
     fn eval(&self, js: String) -> Eval {
         Eval::new(DesktopEvaluator::create(
@@ -44,10 +59,7 @@ impl Document for DesktopDocument {
         let myself = self.clone();
         queue_effect(move || {
             let js = create_element_in_head("meta", &props.attributes(), None);
-            if let Some(ctx) = myself.desktop_ctx.upgrade() {
-                ctx.remember_head_element(js.clone());
-            }
-            myself.eval(js);
+            myself.put_in_head(js);
         });
     }
 
@@ -57,10 +69,7 @@ impl Document for DesktopDocument {
         queue_effect(move || {
             let js =
                 create_element_in_head("script", &props.attributes(), props.script_contents().ok());
-            if let Some(ctx) = myself.desktop_ctx.upgrade() {
-                ctx.remember_head_element(js.clone());
-            }
-            myself.eval(js);
+            myself.put_in_head(js);
         });
     }
 
@@ -70,10 +79,7 @@ impl Document for DesktopDocument {
         queue_effect(move || {
             let js =
                 create_element_in_head("style", &props.attributes(), props.style_contents().ok());
-            if let Some(ctx) = myself.desktop_ctx.upgrade() {
-                ctx.remember_head_element(js.clone());
-            }
-            myself.eval(js);
+            myself.put_in_head(js);
         });
     }
 
@@ -82,10 +88,7 @@ impl Document for DesktopDocument {
         let myself = self.clone();
         queue_effect(move || {
             let js = create_element_in_head("link", &props.attributes(), None);
-            if let Some(ctx) = myself.desktop_ctx.upgrade() {
-                ctx.remember_head_element(js.clone());
-            }
-            myself.eval(js);
+            myself.put_in_head(js);
         });
     }
 }
