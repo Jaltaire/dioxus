@@ -1106,3 +1106,4 @@ path = "examples/scripts/scrape_examples.rs"
 
 [patch.crates-io]
 wry = { git = "https://github.com/Jaltaire/wry", branch = "main-jaltaire" }
+sledgehammer_bindgen_macro = { git = "https://github.com/Jaltaire/sledgehammer_bindgen", branch = "main-jaltaire" }

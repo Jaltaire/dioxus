@@ -11895,8 +11895,7 @@ dependencies = [
 [[package]]
 name = "sledgehammer_bindgen_macro"
 version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb251b407f50028476a600541542b605bb864d35d9ee1de4f6cab45d88475e6d"
+source = "git+https://github.com/Jaltaire/sledgehammer_bindgen?branch=main-jaltaire#5a2930bb1337d5fa8870e31bfdc35bfbe89c5e35"
 dependencies = [
  "quote",
  "syn 2.0.117",
