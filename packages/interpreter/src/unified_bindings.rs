@@ -84,7 +84,7 @@ mod js {
         "#
     }
     fn remove_event_listener(event_name: &str<u8, evt>, id: u32, bubbles: u8) {
-        "{let node = this.nodes[$id$]; node.listening -= 1; node.removeAttribute('data-dioxus-id'); this.removeListener(node, $event_name$, $bubbles$);}"
+        "{let node = this.nodes[$id$]; node.listening -= 1; if (node.listening <= 0) { node.removeAttribute('data-dioxus-id'); } this.removeListener(node, $event_name$, $bubbles$);}"
     }
     fn set_text(id: u32, text: &str) {
         "{this.nodes[$id$].textContent = $text$;}"
