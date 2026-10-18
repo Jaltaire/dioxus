@@ -652,7 +652,7 @@ impl App {
         view.edits.wry_queue.page_arrived();
         view.edits
             .wry_queue
-            .with_mutation_state_mut(|f| view.dom.rebuild_into_a_new_page(f));
+            .with_mutation_state_mut(|f| view.dom.borrow_mut().rebuild_into_a_new_page(f));
 
         view.edits.wry_queue.send_edits();
 
@@ -703,7 +703,7 @@ impl App {
                         // If we're patching the app, we want to make sure it's not going to progress in the interim.
                         #[cfg(target_os = "android")]
                         let _lock = crate::android_sync_lock::android_runtime_lock();
-                        dioxus_devtools::apply_changes(&webview.dom, &hr_msg);
+                        dioxus_devtools::apply_changes(&webview.dom.borrow(), &hr_msg);
                     }
 
                     webview.poll_vdom();

@@ -68,21 +68,21 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 // Windows-only drag-n-drop fix events. We need to call the interpreter drag-n-drop code.
                 UserWindowEvent::WindowsDragDrop(id) => {
                     if let Some(webview) = app.webviews.get(&id) {
-                        webview.dom.in_scope(ScopeId::ROOT, || {
+                        webview.dom.borrow().in_scope(ScopeId::ROOT, || {
                             eval("window.interpreter.handleWindowsDragDrop();");
                         });
                     }
                 }
                 UserWindowEvent::WindowsDragLeave(id) => {
                     if let Some(webview) = app.webviews.get(&id) {
-                        webview.dom.in_scope(ScopeId::ROOT, || {
+                        webview.dom.borrow().in_scope(ScopeId::ROOT, || {
                             eval("window.interpreter.handleWindowsDragLeave();");
                         });
                     }
                 }
                 UserWindowEvent::WindowsDragOver(id, x_pos, y_pos) => {
                     if let Some(webview) = app.webviews.get(&id) {
-                        webview.dom.in_scope(ScopeId::ROOT, || {
+                        webview.dom.borrow().in_scope(ScopeId::ROOT, || {
                             let e = eval(
                                 r#"
                                     const xPos = await dioxus.recv();

@@ -387,6 +387,10 @@ export class NativeInterpreter extends JSChannel_ {
     const response = this.sendSerializedEvent(body);
     // capture/prevent default of the event if the virtualdom wants to
     if (response) {
+      if (response.edits) {
+        this.runEditsInFrame(response.edits);
+      }
+
       if (response.preventDefault) {
         event.preventDefault();
       } else {
@@ -414,6 +418,15 @@ export class NativeInterpreter extends JSChannel_ {
       // Run the event handler on the virtualdom
       return handleVirtualdomEventSync(this.eventsPath, JSON.stringify(body));
     }
+  }
+
+  runEditsInFrame(encoded: string) {
+    const text = atob(encoded);
+    const bytes = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) {
+      bytes[i] = text.charCodeAt(i);
+    }
+    (this as any).run_from_bytes(bytes.buffer);
   }
 
   handleClickNavigate(event: Event, target: Element) {
@@ -564,6 +577,7 @@ export class NativeInterpreter extends JSChannel_ {
 type EventSyncResult = {
   preventDefault: boolean;
   stopPropagation: boolean;
+  edits?: string;
 };
 
 // This function sends the event to the virtualdom and then waits for the virtualdom to process it

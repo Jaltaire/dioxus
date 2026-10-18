@@ -114,6 +114,21 @@ impl WryQueue {
         myself.mutation_state = MutationState::default();
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.page_awaited {
+            return false;
+        }
+        match inner.edits_in_progress.as_mut() {
+            None => true,
+            Some(receiver) => !matches!(receiver.try_recv(), Ok(None)),
+        }
+    }
+
+    pub(crate) fn take_rendered(&self) -> Vec<u8> {
+        self.inner.borrow_mut().mutation_state.export_memory()
+    }
+
     /// Wait until all pending edits have been rendered in the webview
     pub(crate) fn poll_edits_flushed(
         &self,
@@ -817,4 +832,67 @@ fn owned_notify_future(notify: Arc<Notify>) -> Pin<Box<dyn Future<Output = ()>>>
     // Start tracking notify before the output future is polled
     _ = (&mut notify_owned).now_or_never();
     notify_owned
+}
+
+#[cfg(test)]
+mod in_frame_tests {
+    use super::*;
+
+    fn queue() -> WryQueue {
+        EditWebsocket::start().create_queue()
+    }
+
+    #[test]
+    fn a_queue_with_nothing_sent_is_idle() {
+        assert!(queue().is_idle());
+    }
+
+    #[test]
+    fn edits_on_their_way_to_the_page_keep_the_queue_busy() {
+        let queue = queue();
+        let (sender, receiver) = oneshot::channel();
+        queue.inner.borrow_mut().edits_in_progress = Some(receiver);
+        assert!(!queue.is_idle());
+        assert!(!queue.is_idle(), "Asking twice does not settle anything.");
+        sender.send(()).unwrap();
+        assert!(queue.is_idle());
+        assert!(queue.is_idle(), "Once applied, the edits stay applied.");
+    }
+
+    #[test]
+    fn edits_whose_page_went_away_keep_nothing_busy() {
+        let queue = queue();
+        let (sender, receiver) = oneshot::channel::<()>();
+        queue.inner.borrow_mut().edits_in_progress = Some(receiver);
+        drop(sender);
+        assert!(queue.is_idle());
+    }
+
+    #[test]
+    fn edits_sent_to_the_page_keep_the_queue_busy_until_it_answers() {
+        let queue = queue();
+        queue.send_edits();
+        assert!(!queue.is_idle());
+    }
+
+    #[test]
+    fn a_page_being_replaced_keeps_the_queue_busy_until_it_arrives() {
+        let queue = queue();
+        queue.forget_connection();
+        assert!(!queue.is_idle());
+        queue.page_arrived();
+        assert!(queue.is_idle());
+    }
+
+    #[test]
+    fn what_was_rendered_is_taken_once() {
+        let queue = queue();
+        queue.with_mutation_state_mut(|state| {
+            dioxus_core::WriteMutations::create_placeholder(state, dioxus_core::ElementId(1));
+        });
+        let first = queue.take_rendered();
+        assert!(!first.is_empty());
+        let second = queue.take_rendered();
+        assert_ne!(first, second, "What was taken is not taken again.");
+    }
 }

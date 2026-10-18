@@ -15,8 +15,10 @@ use dioxus_history::{History, MemoryHistory};
 use dioxus_hooks::to_owned;
 use dioxus_html::{FileData, FormValue, HtmlEvent, PlatformEventData, SerializedFileData};
 use futures_util::{FutureExt, pin_mut};
+use std::cell::{OnceCell, RefCell};
+use std::rc::Weak;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::{cell::OnceCell, time::Duration};
+use std::time::Duration;
 use std::{rc::Rc, task::Waker};
 use wry::{DragDropEvent, RequestAsyncResponder, WebContext, WebViewBuilder, WebViewId};
 
@@ -25,15 +27,37 @@ pub(crate) struct WebviewEdits {
     runtime: Rc<Runtime>,
     pub wry_queue: WryQueue,
     desktop_context: Rc<OnceCell<WeakDesktopContext>>,
+    dom: Weak<RefCell<VirtualDom>>,
+}
+
+const ANSWERED_IN_THEIR_FRAME: &[&str] = &["resize"];
+
+pub(crate) fn answered_in_its_frame(name: &str) -> bool {
+    ANSWERED_IN_THEIR_FRAME.contains(&name)
 }
 
 impl WebviewEdits {
-    fn new(runtime: Rc<Runtime>, wry_queue: WryQueue) -> Self {
+    fn new(runtime: Rc<Runtime>, wry_queue: WryQueue, dom: Weak<RefCell<VirtualDom>>) -> Self {
         Self {
             runtime,
             wry_queue,
             desktop_context: Default::default(),
+            dom,
         }
+    }
+
+    fn render_in_frame(&self) -> Option<String> {
+        let dom = self.dom.upgrade()?;
+        if !self.wry_queue.is_idle() {
+            return None;
+        }
+        let mut dom = dom.try_borrow_mut().ok()?;
+        self.wry_queue
+            .with_mutation_state_mut(|state| dom.render_immediate(state));
+        Some(base64::Engine::encode(
+            &BASE64_STANDARD,
+            self.wry_queue.take_rendered(),
+        ))
     }
 
     fn set_desktop_context(&self, context: WeakDesktopContext) {
@@ -191,12 +215,17 @@ impl WebviewEdits {
         self.runtime.handle_event(&name, event.clone(), element);
 
         // Get the response from the event
-        SynchronousEventResponse::new(!event.default_action_enabled())
+        SynchronousEventResponse {
+            prevent_default: !event.default_action_enabled(),
+            edits: answered_in_its_frame(&name)
+                .then(|| self.render_in_frame())
+                .flatten(),
+        }
     }
 }
 
 pub(crate) struct WebviewInstance {
-    pub dom: VirtualDom,
+    pub dom: Rc<RefCell<VirtualDom>>,
     pub edits: WebviewEdits,
     pub desktop_context: DesktopContext,
     pub waker: Waker,
@@ -268,7 +297,12 @@ impl WebviewInstance {
         }));
         let edit_queue = shared.websocket.create_queue();
         let asset_handlers = AssetHandlerRegistry::new();
-        let edits = WebviewEdits::new(dom.runtime(), edit_queue.clone());
+        let dom = Rc::new(RefCell::new(dom));
+        let edits = WebviewEdits::new(
+            dom.borrow().runtime(),
+            edit_queue.clone(),
+            Rc::downgrade(&dom),
+        );
         let file_hover = NativeFileHover::default();
         let headless = !cfg.window.window.visible;
 
@@ -599,7 +633,7 @@ impl WebviewInstance {
         edits.set_desktop_context(Rc::downgrade(&desktop_context));
         let provider: Rc<dyn Document> = Rc::new(DesktopDocument::new(desktop_context.clone()));
         let history_provider: Rc<dyn History> = Rc::new(MemoryHistory::default());
-        dom.in_scope(ScopeId::ROOT, || {
+        dom.borrow().in_scope(ScopeId::ROOT, || {
             provide_context(desktop_context.clone());
             provide_context(provider);
             provide_context(history_provider);
@@ -653,7 +687,8 @@ impl WebviewInstance {
                 // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers and async tasks
                 #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
-                let fut = self.dom.wait_for_work();
+                let mut dom = self.dom.borrow_mut();
+                let fut = dom.wait_for_work();
                 pin_mut!(fut);
 
                 match fut.poll_unpin(&mut cx) {
@@ -668,7 +703,7 @@ impl WebviewInstance {
 
             self.edits
                 .wry_queue
-                .with_mutation_state_mut(|f| self.dom.render_immediate(f));
+                .with_mutation_state_mut(|f| self.dom.borrow_mut().render_immediate(f));
             self.edits.wry_queue.send_edits();
         }
     }
@@ -714,13 +749,18 @@ impl WebviewInstance {
 pub struct SynchronousEventResponse {
     #[serde(rename = "preventDefault")]
     prevent_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edits: Option<String>,
 }
 
 impl SynchronousEventResponse {
     /// Create a new SynchronousEventResponse
     #[allow(unused)]
     pub fn new(prevent_default: bool) -> Self {
-        Self { prevent_default }
+        Self {
+            prevent_default,
+            edits: None,
+        }
     }
 }
 
@@ -745,9 +785,56 @@ impl PendingWebview {
 
         let cx = window
             .dom
+            .borrow()
             .in_scope(ScopeId::ROOT, consume_context::<Rc<DesktopService>>);
         _ = self.sender.send(cx);
 
         window
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_resize_is_answered_in_its_frame() {
+        assert!(answered_in_its_frame("resize"));
+    }
+
+    #[test]
+    fn every_other_event_is_answered_the_usual_way() {
+        for name in [
+            "click",
+            "scroll",
+            "touchstart",
+            "touchmove",
+            "input",
+            "mounted",
+            "visible",
+            "resized",
+            "Resize",
+            "",
+        ] {
+            assert!(!answered_in_its_frame(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_response_without_edits_says_nothing_of_them() {
+        let response = serde_json::to_value(SynchronousEventResponse::new(true)).unwrap();
+        assert_eq!(response, serde_json::json!({ "preventDefault": true }));
+    }
+
+    #[test]
+    fn a_response_with_edits_carries_them_beside_the_default_action() {
+        let response = SynchronousEventResponse {
+            prevent_default: false,
+            edits: Some("AAEC".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({ "preventDefault": false, "edits": "AAEC" })
+        );
     }
 }
