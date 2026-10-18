@@ -44,3 +44,6 @@ webonly = [
 ]
 binary-protocol = ["sledgehammer", "dep:dioxus-core", "dep:dioxus-core-types", "dep:dioxus-html"]
 minimal_bindings = []
+
+[dev-dependencies]
+boa_engine = "0.22.0"

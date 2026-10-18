@@ -182,7 +182,7 @@ export class NativeInterpreter extends JSChannel_ {
 
   scrollTo(id: NodeId, options: ScrollIntoViewOptions): boolean {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       node.scrollIntoView(options);
       return true;
     }
@@ -191,7 +191,7 @@ export class NativeInterpreter extends JSChannel_ {
 
   scroll(id: NodeId, x: number, y: number, behavior: ScrollBehavior): boolean {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       node.scroll({ top: y, left: x, behavior });
       return true;
     }
@@ -200,28 +200,28 @@ export class NativeInterpreter extends JSChannel_ {
 
   getScrollHeight(id: NodeId): number | undefined {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       return node.scrollHeight;
     }
   }
 
   getScrollLeft(id: NodeId): number | undefined {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       return node.scrollLeft;
     }
   }
 
   getScrollTop(id: NodeId): number | undefined {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       return node.scrollTop;
     }
   }
 
   getScrollWidth(id: NodeId): number | undefined {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       return node.scrollWidth;
     }
   }
@@ -230,7 +230,7 @@ export class NativeInterpreter extends JSChannel_ {
     id: NodeId
   ): { type: string; origin: number[]; size: number[] } | undefined {
     const node = this.nodes[id];
-    if (node instanceof HTMLElement) {
+    if (node instanceof Element) {
       const rect = node.getBoundingClientRect();
       return {
         type: "GetClientRect",
@@ -243,7 +243,7 @@ export class NativeInterpreter extends JSChannel_ {
   setFocus(id: NodeId, focus: boolean) {
     const node = this.nodes[id];
 
-    if (node instanceof HTMLElement) {
+    if (node instanceof HTMLElement || node instanceof SVGElement) {
       if (focus) {
         node.focus();
       } else {
