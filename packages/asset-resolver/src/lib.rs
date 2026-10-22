@@ -54,17 +54,18 @@ pub enum AssetPathError {
 
 /// Tries to resolve the path of an asset from a given URI path. Depending on the platform, this may
 /// return an error even if the asset exists because some platforms cannot represent assets as paths.
-/// You should prefer [`read_asset_bytes`] to read the asset bytes directly
-/// for cross-platform compatibility.
+/// You should prefer [`read_asset_bytes`] to read asset bytes across platforms.
 ///
 /// ## Platform specific behavior
 ///
-/// This function will only work on desktop platforms. It will always return an error in web and Android
-/// bundles. On Android assets are bundled in the APK, and cannot be represented as paths. In web bundles,
-/// Assets are fetched via HTTP requests and don't have a filesystem path.
+/// This function resolves paths inside desktop asset bundles. It rejects paths outside the canonical
+/// asset root, traversal components, and symlinks that escape the root. Absolute source paths from an
+/// unbundled application are not supported. Build the application with the Dioxus CLI to bundle assets.
+/// It always returns an error in web and Android bundles. Android assets are bundled in the APK, and
+/// web assets are fetched via HTTP requests, so neither has a filesystem path.
 ///
 /// ## Example
-/// ```rust
+/// ```rust,no_run
 /// use dioxus::prelude::*;
 ///
 /// // Bundle the static JSON asset into the application

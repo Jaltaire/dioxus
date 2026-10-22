@@ -2,7 +2,7 @@
 //! need to resolve asset bundles for resources like images, and fonts.
 
 use http::{Response, status::StatusCode};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::{AssetPathError, NativeAssetResolveError};
 
@@ -38,29 +38,45 @@ pub(crate) fn resolve_native_asset_path(path: &str) -> Result<PathBuf, AssetPath
 
 /// Try to resolve the path of an asset from a given URI path.
 fn resolve_asset_path_from_filesystem(path: &str) -> Option<PathBuf> {
-    // If the user provided a custom asset handler, then call it and return the response if the request was handled.
-    // The path is the first part of the URI, so we need to trim the leading slash.
-    let mut uri_path = PathBuf::from(
-        percent_encoding::percent_decode_str(path)
-            .decode_utf8()
-            .expect("expected URL to be UTF-8 encoded")
-            .as_ref(),
-    );
-
-    // If the asset doesn't exist, or starts with `/assets/`, then we'll try to serve out of the bundle
-    // This lets us handle both absolute and relative paths without being too "special"
-    // It just means that our macos bundle is a little "special" because we need to place an `assets`
-    // dir in the `Resources` dir.
-    //
-    // If there's no asset root, we use the cargo manifest dir as the root, or the current dir
-    if !uri_path.exists() || uri_path.starts_with("/assets/") {
-        let bundle_root = get_asset_root();
-        let relative_path = uri_path.strip_prefix("/").unwrap();
-        uri_path = bundle_root.join(relative_path);
+    if cfg!(target_os = "android") {
+        return None;
     }
+    resolve_asset_path_from_root(path, &get_asset_root())
+}
 
-    // If the asset exists, return it
-    uri_path.exists().then_some(uri_path)
+fn resolve_asset_path_from_root(path: &str, bundle_root: &Path) -> Option<PathBuf> {
+    // The path is the first part of the URI, so we need to trim the leading slash.
+    let relative_path = relative_asset_path(path)?;
+    canonical_asset_path(bundle_root, &relative_path)
+}
+
+fn relative_asset_path(path: &str) -> Option<PathBuf> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?;
+    let relative = match decoded.strip_prefix('/') {
+        Some(relative) => relative,
+        None => decoded.as_ref(),
+    };
+    if relative.contains(['\\', ':', '\0'])
+        || relative
+            .split('/')
+            .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return None;
+    }
+    let relative = PathBuf::from(relative);
+    relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+        .then_some(relative)
+}
+
+fn canonical_asset_path(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let asset = root.join(relative).canonicalize().ok()?;
+    // If the asset exists, return it.
+    (asset.starts_with(root) && asset.is_file()).then_some(asset)
 }
 
 struct ResolvedAsset {
@@ -76,7 +92,6 @@ impl ResolvedAsset {
     fn into_response(self) -> Result<Response<Vec<u8>>, AssetServeError> {
         Ok(Response::builder()
             .header("Content-Type", self.mime_type)
-            .header("Access-Control-Allow-Origin", "*")
             .body(self.body)?)
     }
 }
@@ -94,7 +109,7 @@ pub(crate) fn resolve_native_asset(path: &str) -> Result<Vec<u8>, NativeAssetRes
     let Some(uri_path) = resolve_asset_path_from_filesystem(path) else {
         return Err(NativeAssetResolveError::IoError(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Asset not found",
+            "The asset was not found.",
         )));
     };
     Ok(std::fs::read(uri_path)?)
@@ -246,17 +261,26 @@ pub fn get_mime_from_ext(ext: Option<&str>) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+fn android_asset_relative_path(filepath: &str) -> Option<PathBuf> {
+    let relative = relative_asset_path(filepath)?;
+    match relative.strip_prefix("assets") {
+        Ok(normalized) if normalized.as_os_str().is_empty() => None,
+        Ok(normalized) => Some(normalized.to_path_buf()),
+        Err(_) => Some(relative),
+    }
+}
+
 #[cfg(target_os = "android")]
 pub(crate) fn to_java_load_asset(filepath: &str) -> Option<Vec<u8>> {
-    let normalized = filepath
-        .trim_start_matches("/assets/")
-        .trim_start_matches('/');
+    let normalized = android_asset_relative_path(filepath)?;
 
-    // in debug mode, the asset might be under `/data/local/tmp/dx/` - attempt to read it from there if it exists
+    // In debug mode, attempt to read the asset from the session cache if it exists.
     #[cfg(debug_assertions)]
     {
-        let path = dioxus_cli_config::android_session_cache_dir().join(normalized);
-        if path.exists() {
+        if let Some(path) =
+            canonical_asset_path(&dioxus_cli_config::android_session_cache_dir(), &normalized)
+        {
             return std::fs::read(path).ok();
         }
     }
@@ -287,9 +311,272 @@ pub(crate) fn to_java_load_asset(filepath: &str) -> Option<Vec<u8>> {
             NonNull::new(asset_manager).expect("Invalid asset manager"),
         );
 
-        let cstr = std::ffi::CString::new(normalized).unwrap();
+        let cstr = std::ffi::CString::new(normalized.to_str()?).ok()?;
 
         let mut asset = asset_manager.open(&cstr)?;
         Some(asset.buffer().unwrap().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Assets {
+        directory: tempfile::TempDir,
+        root: PathBuf,
+    }
+
+    impl Assets {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("bundle");
+            std::fs::create_dir_all(root.join("assets")).unwrap();
+            Self { directory, root }
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::write(&path, "An asset.").unwrap();
+            path.canonicalize().unwrap()
+        }
+
+        fn outside_file(&self) -> PathBuf {
+            let path = self.directory.path().join("outside.txt");
+            std::fs::write(&path, "Private data.").unwrap();
+            path.canonicalize().unwrap()
+        }
+
+        fn resolve(&self, path: &str) -> Option<PathBuf> {
+            resolve_asset_path_from_root(path, &self.root)
+        }
+    }
+
+    #[test]
+    fn absolute_filesystem_paths_are_not_served() {
+        let assets = Assets::new();
+        let path = assets.outside_file();
+        let response = serve_asset(path.to_str().unwrap()).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(assets.resolve(path.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn traversal_cannot_escape_the_asset_root() {
+        let assets = Assets::new();
+        assets.outside_file();
+        for path in [
+            "/assets/../../outside.txt",
+            "/assets/%2e%2e/%2e%2e/outside.txt",
+            "/assets/%2E%2E%2F%2e%2e%2foutside.txt",
+            "/assets/..%2f..%2foutside.txt",
+            "/assets/..%5c..%5coutside.txt",
+            "../outside.txt",
+            "assets/../../outside.txt",
+        ] {
+            assert!(
+                assets.resolve(path).is_none(),
+                "The resolver allowed {path}."
+            );
+        }
+    }
+
+    #[test]
+    fn paths_are_relative_to_the_bundle_instead_of_the_working_directory() {
+        let assets = Assets::new();
+        let file = assets.file("Cargo.toml");
+        assert_eq!(assets.resolve("Cargo.toml"), Some(file.clone()));
+        assert_eq!(assets.resolve("/Cargo.toml"), Some(file));
+    }
+
+    #[test]
+    fn bundled_assets_are_canonicalized_after_decoding_once() {
+        let assets = Assets::new();
+        let file = assets.file("assets/an asset-音.svg");
+        for path in [
+            "/assets/an%20asset-%E9%9F%B3.svg",
+            "assets/an asset-音.svg",
+            "/assets%2fan%20asset-音.svg",
+        ] {
+            assert_eq!(assets.resolve(path), Some(file.clone()));
+        }
+        let literal = assets.file("assets/%2e%2e.txt");
+        assert_eq!(assets.resolve("/assets/%252e%252e.txt"), Some(literal));
+    }
+
+    #[test]
+    fn ambiguous_and_platform_specific_paths_are_rejected() {
+        for path in [
+            "",
+            "/",
+            "//assets/file.txt",
+            "/%2fassets/file.txt",
+            "assets//file.txt",
+            "assets/",
+            "./assets/file.txt",
+            "/assets/./file.txt",
+            "/assets/%2e/file.txt",
+            "/assets/../file.txt",
+            "C:/file.txt",
+            "/C:/file.txt",
+            "C:file.txt",
+            "C%3a/file.txt",
+            r"C:\file.txt",
+            r"\\server\share\file.txt",
+            r"/assets\file.txt",
+            "/assets/file.txt:stream",
+            "/assets/file%00.txt",
+            "/assets/%ff.txt",
+            "/assets/%c0%af.txt",
+            "file:///assets/file.txt",
+            "/assets/.%2e/file.txt",
+        ] {
+            assert!(
+                relative_asset_path(path).is_none(),
+                "The parser allowed {path}."
+            );
+        }
+    }
+
+    #[test]
+    fn missing_assets_roots_and_directories_are_not_files() {
+        let assets = Assets::new();
+        assert!(assets.resolve("/assets/missing.txt").is_none());
+        assert!(assets.resolve("/assets").is_none());
+        assert!(resolve_asset_path_from_root("/file.txt", &assets.root.join("missing")).is_none());
+        let file = assets.file("file.txt");
+        assert!(resolve_asset_path_from_root("/file.txt", &file).is_none());
+    }
+
+    #[test]
+    fn traversal_is_rejected_even_when_it_would_stay_inside_the_root() {
+        let assets = Assets::new();
+        assets.file("file.txt");
+        assert!(assets.resolve("/assets/../file.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_and_directory_symlinks_cannot_escape_the_asset_root() {
+        let assets = Assets::new();
+        let outside = assets.outside_file();
+        std::os::unix::fs::symlink(outside, assets.root.join("assets/link.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            assets.directory.path(),
+            assets.root.join("assets/directory"),
+        )
+        .unwrap();
+        assert!(assets.resolve("/assets/link.txt").is_none());
+        assert!(assets.resolve("/assets/directory/outside.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_directories_with_the_same_prefix_are_outside_the_root() {
+        let assets = Assets::new();
+        let sibling = assets.directory.path().join("bundle-extra");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("outside.txt"), "Private data.").unwrap();
+        std::os::unix::fs::symlink(sibling, assets.root.join("assets/sibling")).unwrap();
+        assert!(assets.resolve("/assets/sibling/outside.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_within_the_root_and_an_aliased_root_are_supported() {
+        let assets = Assets::new();
+        let file = assets.file("assets/file.txt");
+        std::os::unix::fs::symlink(&file, assets.root.join("assets/link.txt")).unwrap();
+        std::os::unix::fs::symlink(assets.root.join("assets"), assets.root.join("alias")).unwrap();
+        let root_alias = assets.directory.path().join("root-alias");
+        std::os::unix::fs::symlink(&assets.root, &root_alias).unwrap();
+        assert_eq!(assets.resolve("/assets/link.txt"), Some(file.clone()));
+        assert_eq!(assets.resolve("/alias/file.txt"), Some(file.clone()));
+        assert_eq!(
+            resolve_asset_path_from_root("/assets/file.txt", &root_alias),
+            Some(file)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_and_looping_symlinks_are_not_served() {
+        let assets = Assets::new();
+        std::os::unix::fs::symlink("missing.txt", assets.root.join("assets/broken.txt")).unwrap();
+        std::os::unix::fs::symlink("loop.txt", assets.root.join("assets/loop.txt")).unwrap();
+        assert!(assets.resolve("/assets/broken.txt").is_none());
+        assert!(assets.resolve("/assets/loop.txt").is_none());
+    }
+
+    #[test]
+    fn android_asset_paths_are_validated_before_removing_one_asset_prefix() {
+        for path in [
+            "/assets/file.txt",
+            "assets/file.txt",
+            "/file.txt",
+            "file.txt",
+        ] {
+            assert_eq!(
+                android_asset_relative_path(path),
+                Some(PathBuf::from("file.txt"))
+            );
+        }
+        assert_eq!(
+            android_asset_relative_path("/assets/assets/file.txt"),
+            Some(PathBuf::from("assets/file.txt"))
+        );
+        for path in [
+            "assets",
+            "/assets",
+            "/assets/../file.txt",
+            "/assets/%2e%2e/file.txt",
+            "//outside.txt",
+            "C:/outside.txt",
+            "/assets/file%00.txt",
+            "/assets/%ff.txt",
+        ] {
+            assert!(
+                android_asset_relative_path(path).is_none(),
+                "The Android resolver allowed {path}."
+            );
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_does_not_serve_files_from_the_process_executable_directory() {
+        assert!(resolve_asset_path_from_filesystem("app_process64").is_none());
+    }
+
+    #[test]
+    fn malformed_utf8_is_not_served() {
+        let response = serve_asset("/assets/%ff.txt").unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn asset_responses_preserve_the_body_and_mime_type_without_granting_cross_origin_access() {
+        let response = ResolvedAsset::new("text/plain", b"An asset.".to_vec())
+            .into_response()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(response.body(), b"An asset.");
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+    }
+
+    #[test]
+    fn missing_assets_do_not_grant_cross_origin_access() {
+        let response = serve_asset("/assets/missing.txt").unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
     }
 }

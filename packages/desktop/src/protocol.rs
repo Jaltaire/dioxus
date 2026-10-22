@@ -9,7 +9,11 @@ use dioxus_interpreter_js::NATIVE_JS;
 use dioxus_interpreter_js::unified_bindings::SLEDGEHAMMER_JS;
 use wry::{
     RequestAsyncResponder,
-    http::{Request, Response, status::StatusCode},
+    http::{
+        HeaderValue, Request, Response,
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
+        status::StatusCode,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,18 +43,57 @@ impl PageAddress {
         }
     }
 
-    const fn origin(self) -> &'static str {
-        match self {
-            Self::CustomScheme => "dioxus://",
-            Self::Http => "http://dioxus.",
-            Self::Https => "https://dioxus.",
-        }
+    fn origin(self) -> &'static str {
+        self.index().trim_end_matches('/')
     }
 
     pub(crate) fn serves(url: &str) -> bool {
-        Self::ALL
-            .iter()
-            .any(|address| url.starts_with(address.origin()))
+        Self::ALL.iter().any(|address| {
+            url.strip_prefix(address.origin())
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['/', '?', '#']))
+        })
+    }
+
+    fn request_origin(
+        self,
+        request: &Request<Vec<u8>>,
+    ) -> Result<RequestOrigin, Response<Vec<u8>>> {
+        if Self::serves(&request.uri().to_string()) {
+            let mut origins = request.headers().get_all(ORIGIN).iter();
+            match (origins.next(), origins.next()) {
+                (None, None) => return Ok(RequestOrigin::Absent),
+                (Some(origin), None) if origin.as_bytes() == self.origin().as_bytes() => {
+                    return Ok(RequestOrigin::Application(self));
+                }
+                _ => {}
+            }
+        }
+        Err(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(b"The request origin is not allowed.".to_vec())
+            .unwrap())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOrigin {
+    Absent,
+    Application(PageAddress),
+}
+
+impl RequestOrigin {
+    fn response(self, mut response: Response<Vec<u8>>) -> Response<Vec<u8>> {
+        response.headers_mut().remove(ACCESS_CONTROL_ALLOW_ORIGIN);
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Origin"));
+        if let Self::Application(address) = self {
+            response.headers_mut().insert(
+                ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static(address.origin()),
+            );
+        }
+        response
     }
 }
 
@@ -78,7 +121,12 @@ pub(super) fn desktop_handler(
     root_name: &str,
     headless: bool,
 ) {
-    // Try to serve the index file first
+    let origin = match PageAddress::THIS_PLATFORM.request_origin(&request) {
+        Ok(origin) => origin,
+        Err(response) => return responder.respond(response),
+    };
+
+    // Try to serve the index file first.
     if let Some(index_bytes) = index_request(
         &request,
         custom_head,
@@ -87,7 +135,7 @@ pub(super) fn desktop_handler(
         headless,
         edit_state,
     ) {
-        return responder.respond(index_bytes);
+        return responder.respond(origin.response(index_bytes));
     }
 
     // If the request is asking for edits (ie binary protocol streaming), do that
@@ -116,12 +164,14 @@ pub(super) fn desktop_handler(
     }
 
     match dioxus_asset_resolver::native::serve_asset(request.uri().path()) {
-        Ok(res) => responder.respond(res),
+        Ok(res) => responder.respond(origin.response(res)),
         Err(_e) => responder.respond(
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(String::from("Failed to serve asset").into_bytes())
-                .unwrap(),
+            origin.response(
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(String::from("The asset could not be served.").into_bytes())
+                    .unwrap(),
+            ),
         ),
     }
 }
@@ -167,7 +217,6 @@ fn index_request(
 
     Response::builder()
         .header("Content-Type", "text/html")
-        .header("Access-Control-Allow-Origin", "*")
         .body(index.into())
         .ok()
 }
@@ -311,7 +360,26 @@ fn respond_to_file_dialog(
 
 #[cfg(test)]
 mod page_address_tests {
-    use super::PageAddress;
+    use super::{PageAddress, RequestOrigin};
+    use wry::http::{
+        HeaderValue, Request, Response,
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
+        status::StatusCode,
+    };
+
+    fn request(address: PageAddress, origins: &[&str]) -> Request<Vec<u8>> {
+        let mut builder = Request::builder().uri(address.index());
+        for origin in origins {
+            builder = builder.header(ORIGIN, *origin);
+        }
+        builder.body(Vec::new()).unwrap()
+    }
+
+    fn assert_forbidden(result: Result<RequestOrigin, Response<Vec<u8>>>) {
+        let response = result.unwrap_err();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
 
     #[test]
     fn every_address_of_the_page_is_one_the_navigation_guard_serves() {
@@ -372,5 +440,172 @@ mod page_address_tests {
         #[cfg(not(any(target_os = "android", target_os = "windows")))]
         assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::CustomScheme);
         assert_eq!(super::BASE_URI, PageAddress::THIS_PLATFORM.index());
+    }
+
+    #[test]
+    fn exact_application_origins_are_accepted_on_their_own_platform() {
+        for address in PageAddress::ALL {
+            let request = request(address, &[address.origin()]);
+            assert_eq!(
+                address.request_origin(&request).unwrap(),
+                RequestOrigin::Application(address)
+            );
+            for other in PageAddress::ALL
+                .into_iter()
+                .filter(|other| *other != address)
+            {
+                assert_forbidden(other.request_origin(&request));
+            }
+        }
+    }
+
+    #[test]
+    fn requests_without_origin_headers_can_load_the_page_and_assets() {
+        for address in PageAddress::ALL {
+            for target in PageAddress::ALL {
+                let request = request(target, &[]);
+                assert_eq!(
+                    address.request_origin(&request).unwrap(),
+                    RequestOrigin::Absent
+                );
+                for path in ["assets/file.txt", "__events", "__file_dialog"] {
+                    let request = Request::builder()
+                        .uri(format!("{}{path}", target.index()))
+                        .body(Vec::new())
+                        .unwrap();
+                    assert_eq!(
+                        address.request_origin(&request).unwrap(),
+                        RequestOrigin::Absent
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_opaque_and_ambiguous_origins_are_forbidden() {
+        for address in PageAddress::ALL {
+            for origin in [
+                "https://example.com",
+                "null",
+                "*",
+                "",
+                "dioxus://",
+                "dioxus://other.html",
+                "http://dioxus.other.html",
+                "https://dioxus.index.html.evil.example",
+                "https://dioxus.index.html:8443",
+                "https://dioxus.index.html https://example.com",
+            ] {
+                assert_forbidden(address.request_origin(&request(address, &[origin])));
+            }
+            for origin in [
+                format!("{}/", address.origin()),
+                format!("{}.evil.example", address.origin()),
+                format!("{}@evil.example", address.origin()),
+                format!("{}:8443", address.origin()),
+                format!("{}, https://example.com", address.origin()),
+            ] {
+                assert_forbidden(address.request_origin(&request(address, &[&origin])));
+            }
+            assert_forbidden(
+                address.request_origin(&request(address, &[address.origin(), address.origin()])),
+            );
+            assert_forbidden(address.request_origin(&request(
+                address,
+                &[address.origin(), "https://example.com"],
+            )));
+            let mut invalid = request(address, &[]);
+            invalid
+                .headers_mut()
+                .insert(ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
+            assert_forbidden(address.request_origin(&invalid));
+        }
+    }
+
+    #[test]
+    fn lookalike_and_unrelated_request_targets_are_forbidden() {
+        for address in PageAddress::ALL {
+            for target in [
+                format!("{}.evil.example/assets/file.txt", address.origin()),
+                format!("{}@evil.example/assets/file.txt", address.origin()),
+                format!("{}:8443/assets/file.txt", address.origin()),
+                "https://example.com/assets/file.txt".to_string(),
+                "/assets/file.txt".to_string(),
+            ] {
+                assert!(!PageAddress::serves(&target), "The guard allowed {target}.");
+                for origins in [vec![], vec![address.origin()]] {
+                    let mut request = request(address, &origins);
+                    *request.uri_mut() = target.parse().unwrap();
+                    assert_forbidden(address.request_origin(&request));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_accepts_paths_queries_and_fragments_only_after_the_exact_origin() {
+        for address in PageAddress::ALL {
+            for suffix in [
+                "",
+                "/",
+                "/assets/file.txt",
+                "?key=value",
+                "#fragment",
+                "/#fragment",
+            ] {
+                assert!(PageAddress::serves(&format!(
+                    "{}{suffix}",
+                    address.origin()
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn application_responses_grant_only_the_exact_origin_and_preserve_the_response() {
+        for address in PageAddress::ALL {
+            let origin = address
+                .request_origin(&request(address, &[address.origin()]))
+                .unwrap();
+            for status in [
+                StatusCode::OK,
+                StatusCode::NOT_FOUND,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ] {
+                let response = Response::builder()
+                    .status(status)
+                    .header("Content-Type", "text/plain")
+                    .body(b"An asset.".to_vec())
+                    .unwrap();
+                let response = origin.response(response);
+                assert_eq!(response.status(), status);
+                assert_eq!(
+                    response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+                    address.origin()
+                );
+                assert_eq!(response.headers()[VARY], "Origin");
+                assert_eq!(response.headers()["content-type"], "text/plain");
+                assert_eq!(response.body(), b"An asset.");
+            }
+        }
+    }
+
+    #[test]
+    fn responses_without_an_origin_never_grant_cross_origin_access() {
+        let response = Response::builder()
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(VARY, "Accept-Encoding")
+            .body(Vec::new())
+            .unwrap();
+        let response = RequestOrigin::Absent.response(response);
+        assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(vary, ["Accept-Encoding", "Origin"]);
     }
 }
