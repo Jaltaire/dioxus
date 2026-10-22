@@ -34,6 +34,7 @@ ndk-context = { version = "0.1.1" }
 [dev-dependencies]
 dioxus = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []
