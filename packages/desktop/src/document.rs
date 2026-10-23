@@ -107,7 +107,14 @@ impl DesktopEvaluator {
         let owner = UnsyncStorage::owner();
         let query_id = query.id;
         let query = owner.insert(Box::new(DesktopEvaluator { query }) as Box<dyn Evaluator>);
-        desktop_ctx.query.active_requests.slab.borrow_mut()[query_id].owner = Some(owner);
+        desktop_ctx
+            .query
+            .active_requests
+            .requests
+            .borrow_mut()
+            .get_mut(query_id)
+            .expect("A query is registered as it is created.")
+            .owner = Some(owner);
 
         query
     }
