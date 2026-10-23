@@ -3,27 +3,57 @@ use futures_util::{FutureExt, StreamExt};
 use generational_box::Owner;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
-use slab::Slab;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use thiserror::Error;
 
-/// Tracks what query ids are currently active
-pub(crate) struct SharedSlab<T = ()> {
-    pub slab: Rc<RefCell<Slab<T>>>,
+pub(crate) struct Requests<T> {
+    next: usize,
+    entries: HashMap<usize, T>,
 }
 
-impl<T> Clone for SharedSlab<T> {
-    fn clone(&self) -> Self {
+impl<T> Default for Requests<T> {
+    fn default() -> Self {
         Self {
-            slab: self.slab.clone(),
+            next: 0,
+            entries: HashMap::new(),
         }
     }
 }
 
-impl<T> Default for SharedSlab<T> {
+impl<T> Requests<T> {
+    pub fn insert(&mut self, entry: T) -> usize {
+        let id = self.next;
+        self.next += 1;
+        self.entries.insert(id, entry);
+        id
+    }
+
+    pub fn get_mut(&mut self, id: usize) -> Option<&mut T> {
+        self.entries.get_mut(&id)
+    }
+
+    pub fn remove(&mut self, id: usize) -> Option<T> {
+        self.entries.remove(&id)
+    }
+}
+
+/// Tracks what query ids are currently active
+pub(crate) struct SharedRequests<T> {
+    pub requests: Rc<RefCell<Requests<T>>>,
+}
+
+impl<T> Clone for SharedRequests<T> {
+    fn clone(&self) -> Self {
+        Self {
+            requests: self.requests.clone(),
+        }
+    }
+}
+
+impl<T> Default for SharedRequests<T> {
     fn default() -> Self {
-        SharedSlab {
-            slab: Rc::new(RefCell::new(Slab::new())),
+        Self {
+            requests: Rc::new(RefCell::new(Requests::default())),
         }
     }
 }
@@ -37,7 +67,7 @@ pub(crate) struct QueryEntry {
 /// Handles sending and receiving arbitrary queries from the webview. Queries can be resolved non-sequentially, so we use ids to track them.
 #[derive(Clone, Default)]
 pub(crate) struct QueryEngine {
-    pub active_requests: SharedSlab<QueryEntry>,
+    pub active_requests: SharedRequests<QueryEntry>,
 }
 
 impl QueryEngine {
@@ -49,11 +79,15 @@ impl QueryEngine {
     ) -> Query<V> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         let (return_tx, return_rx) = futures_channel::oneshot::channel();
-        let request_id = self.active_requests.slab.borrow_mut().insert(QueryEntry {
-            channel_sender: tx,
-            return_sender: Some(return_tx),
-            owner: None,
-        });
+        let request_id = self
+            .active_requests
+            .requests
+            .borrow_mut()
+            .insert(QueryEntry {
+                channel_sender: tx,
+                return_sender: Some(return_tx),
+                owner: None,
+            });
 
         // start the query
         // We embed the return of the eval in a function so we can send it back to the main thread
@@ -117,8 +151,8 @@ impl QueryEngine {
     /// Send a query channel message to the correct query
     pub fn send(&self, data: QueryResult) {
         let QueryResult { id, data } = data;
-        let mut slab = self.active_requests.slab.borrow_mut();
-        if let Some(entry) = slab.get_mut(id) {
+        let mut requests = self.active_requests.requests.borrow_mut();
+        if let Some(entry) = requests.get_mut(id) {
             match data {
                 QueryResultData::Return { data } => {
                     if let Some(sender) = entry.return_sender.take() {
@@ -131,7 +165,7 @@ impl QueryEngine {
                     }
                 }
                 QueryResultData::Drop => {
-                    slab.remove(id);
+                    requests.remove(id);
                 }
                 QueryResultData::Send { data } => {
                     let _ = entry.channel_sender.unbounded_send(data);
@@ -240,4 +274,37 @@ enum QueryResultData {
     Send { data: Value },
     #[serde(rename = "drop")]
     Drop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Requests;
+
+    #[test]
+    fn an_id_is_never_handed_out_twice() {
+        let mut requests = Requests::default();
+        let first = requests.insert("first");
+        assert_eq!(requests.remove(first), Some("first"));
+        let second = requests.insert("second");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_late_report_for_a_finished_query_leaves_the_next_one_running() {
+        let mut requests = Requests::default();
+        let finished = requests.insert("finished");
+        requests.remove(finished);
+        let running = requests.insert("running");
+        assert_eq!(requests.remove(finished), None);
+        assert_eq!(requests.get_mut(running), Some(&mut "running"));
+    }
+
+    #[test]
+    fn an_entry_is_found_until_it_is_removed() {
+        let mut requests = Requests::default();
+        let id = requests.insert(1);
+        *requests.get_mut(id).expect("The entry was just inserted.") += 1;
+        assert_eq!(requests.remove(id), Some(2));
+        assert_eq!(requests.get_mut(id), None);
+    }
 }
