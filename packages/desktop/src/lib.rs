@@ -26,6 +26,7 @@ mod mobile;
 mod opened_urls;
 mod protocol;
 mod query;
+mod resource_response;
 mod shortcut;
 mod waker;
 mod webview;
@@ -56,6 +57,7 @@ pub mod trayicon;
 
 // Public exports
 pub use assets::AssetRequest;
+pub use assets::RequestAsyncResponder;
 pub use config::{Config, WindowCloseBehaviour, WindowConfig};
 pub use default_icon::{default_icon, icon_from_memory, icon_from_path};
 pub use desktop_context::{
@@ -67,4 +69,3 @@ pub use hooks::*;
 pub use ipc::UserWindowEvent;
 pub use shortcut::{HotKeyState, ShortcutHandle, ShortcutRegistryError};
 pub use window_component::{Window, WindowProps};
-pub use wry::RequestAsyncResponder;

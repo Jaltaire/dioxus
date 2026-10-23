@@ -357,6 +357,7 @@ pub struct Config {
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) headless_root: bool,
+    pub(crate) resource_response_policy: crate::resource_response::ResourceResponsePolicy,
 
     /// Configuration for the window opened by `launch`.
     pub(crate) window: WindowConfig,
@@ -375,6 +376,7 @@ impl Config {
             disable_dma_buf_on_wayland: true,
             tray_icon_show_window_on_click: true,
             headless_root: false,
+            resource_response_policy: Default::default(),
             window: WindowConfig::new(),
         }
     }
@@ -588,6 +590,21 @@ impl Config {
     /// this attribute.
     pub fn with_background_throttling(mut self, policy: BackgroundThrottlingPolicy) -> Self {
         self.window = self.window.with_background_throttling(policy);
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn with_resource_response_verifier(
+        mut self,
+        verifier: crate::resource_response::ResourceResponseVerifier,
+    ) -> Self {
+        self.resource_response_policy.verifier = Some(verifier);
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn with_resource_response_verifier_required(mut self, required: bool) -> Self {
+        self.resource_response_policy.required = required;
         self
     }
 }

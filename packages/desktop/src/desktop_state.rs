@@ -22,6 +22,7 @@ pub struct DesktopAppContext {
     pub(crate) event_handlers: WindowEventHandlers,
     pub(crate) shortcut_manager: ShortcutRegistry,
     pub(crate) websocket: EditWebsocket,
+    pub(crate) resource_response_policy: crate::resource_response::ResourceResponsePolicy,
     pending_webviews: RefCell<Vec<PendingWebview>>,
 }
 
@@ -43,6 +44,7 @@ impl DesktopAppContext {
     pub(crate) fn new(
         proxy: EventLoopProxy<UserWindowEvent>,
         target: EventLoopWindowTarget<UserWindowEvent>,
+        resource_response_policy: crate::resource_response::ResourceResponsePolicy,
     ) -> Self {
         Self {
             proxy,
@@ -50,6 +52,7 @@ impl DesktopAppContext {
             event_handlers: WindowEventHandlers::default(),
             shortcut_manager: ShortcutRegistry::new(),
             websocket: EditWebsocket::start(),
+            resource_response_policy,
             pending_webviews: RefCell::new(Vec::new()),
         }
     }

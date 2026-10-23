@@ -120,10 +120,8 @@ fn resolve_asset(path: &str) -> Result<Option<ResolvedAsset>, NativeAssetResolve
     // Attempt to serve from the asset dir on android using its loader
     #[cfg(target_os = "android")]
     {
-        if let Some(asset) = to_java_load_asset(path) {
-            let extension = path.rsplit_once('.').and_then(|(_, ext)| Some(ext));
-            let mime_type = get_mime_from_ext(extension);
-            return Ok(Some(ResolvedAsset::new(mime_type, asset)));
+        if let Some(asset) = resolve_android_asset(path, load_android_asset) {
+            return Ok(Some(asset));
         }
     }
 
@@ -237,28 +235,65 @@ fn get_mime_by_ext(trimmed: &Path) -> &'static str {
 
 /// Get the mime type from a URI using its extension
 pub fn get_mime_from_ext(ext: Option<&str>) -> &'static str {
-    match ext {
+    match ext.map(str::to_ascii_lowercase).as_deref() {
         // The common assets are all utf-8 encoded
-        Some("js") => "text/javascript; charset=utf-8",
+        Some("js" | "mjs" | "cjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml; charset=utf-8",
-        Some("html") => "text/html; charset=utf-8",
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("xhtml" | "xht") => "application/xhtml+xml; charset=utf-8",
 
         // the rest... idk? probably not
-        Some("mjs") => "text/javascript; charset=utf-8",
-        Some("bin") => "application/octet-stream",
+        Some("wasm") => "application/wasm",
+        Some("txt" | "text" | "md") => "text/plain; charset=utf-8",
         Some("csv") => "text/csv",
-        Some("ico") => "image/vnd.microsoft.icon",
+        Some("xml") => "application/xml",
         Some("jsonld") => "application/ld+json",
         Some("rtf") => "application/rtf",
-        Some("mp4") => "video/mp4",
-        // Assume HTML when a TLD is found for eg. `dioxus:://dioxuslabs.app` | `dioxus://hello.com`
-        Some(_) => "text/html; charset=utf-8",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("apng") => "image/apng",
+        Some("jpg" | "jpeg" | "jpe") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        Some("tif" | "tiff") => "image/tiff",
+        Some("ico" | "cur") => "image/vnd.microsoft.icon",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("eot") => "application/vnd.ms-fontobject",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg" | "oga" | "opus") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("aac") => "audio/aac",
+        Some("m4a") => "audio/mp4",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("ogv") => "video/ogg",
+        Some("mov") => "video/quicktime",
+        Some("zip") => "application/zip",
+        Some("gz") => "application/gzip",
+        Some("gltf") => "model/gltf+json",
+        Some("glb") => "model/gltf-binary",
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
         // using octet stream according to this:
-        None => "application/octet-stream",
+        Some(_) | None => "application/octet-stream",
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn resolve_android_asset(
+    path: &str,
+    load: impl FnOnce(&Path) -> Option<Vec<u8>>,
+) -> Option<ResolvedAsset> {
+    let relative = android_asset_relative_path(path)?;
+    let mime_type = get_mime_by_ext(&relative);
+    Some(ResolvedAsset::new(mime_type, load(&relative)?))
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -273,13 +308,16 @@ fn android_asset_relative_path(filepath: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "android")]
 pub(crate) fn to_java_load_asset(filepath: &str) -> Option<Vec<u8>> {
-    let normalized = android_asset_relative_path(filepath)?;
+    load_android_asset(&android_asset_relative_path(filepath)?)
+}
 
+#[cfg(target_os = "android")]
+fn load_android_asset(normalized: &Path) -> Option<Vec<u8>> {
     // In debug mode, attempt to read the asset from the session cache if it exists.
     #[cfg(debug_assertions)]
     {
         if let Some(path) =
-            canonical_asset_path(&dioxus_cli_config::android_session_cache_dir(), &normalized)
+            canonical_asset_path(&dioxus_cli_config::android_session_cache_dir(), normalized)
         {
             return std::fs::read(path).ok();
         }
@@ -578,5 +616,150 @@ mod tests {
                 .headers()
                 .contains_key("access-control-allow-origin")
         );
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+
+    const MIME_TYPES: &[(&str, &str)] = &[
+        ("js", "text/javascript; charset=utf-8"),
+        ("mjs", "text/javascript; charset=utf-8"),
+        ("cjs", "text/javascript; charset=utf-8"),
+        ("css", "text/css; charset=utf-8"),
+        ("json", "application/json; charset=utf-8"),
+        ("svg", "image/svg+xml; charset=utf-8"),
+        ("html", "text/html; charset=utf-8"),
+        ("htm", "text/html; charset=utf-8"),
+        ("xhtml", "application/xhtml+xml; charset=utf-8"),
+        ("xht", "application/xhtml+xml; charset=utf-8"),
+        ("wasm", "application/wasm"),
+        ("txt", "text/plain; charset=utf-8"),
+        ("text", "text/plain; charset=utf-8"),
+        ("md", "text/plain; charset=utf-8"),
+        ("csv", "text/csv"),
+        ("xml", "application/xml"),
+        ("jsonld", "application/ld+json"),
+        ("rtf", "application/rtf"),
+        ("pdf", "application/pdf"),
+        ("png", "image/png"),
+        ("apng", "image/apng"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("jpe", "image/jpeg"),
+        ("gif", "image/gif"),
+        ("webp", "image/webp"),
+        ("avif", "image/avif"),
+        ("bmp", "image/bmp"),
+        ("tif", "image/tiff"),
+        ("tiff", "image/tiff"),
+        ("ico", "image/vnd.microsoft.icon"),
+        ("cur", "image/vnd.microsoft.icon"),
+        ("ttf", "font/ttf"),
+        ("otf", "font/otf"),
+        ("woff", "font/woff"),
+        ("woff2", "font/woff2"),
+        ("eot", "application/vnd.ms-fontobject"),
+        ("mp3", "audio/mpeg"),
+        ("wav", "audio/wav"),
+        ("ogg", "audio/ogg"),
+        ("oga", "audio/ogg"),
+        ("opus", "audio/ogg"),
+        ("flac", "audio/flac"),
+        ("aac", "audio/aac"),
+        ("m4a", "audio/mp4"),
+        ("mp4", "video/mp4"),
+        ("m4v", "video/mp4"),
+        ("webm", "video/webm"),
+        ("ogv", "video/ogg"),
+        ("mov", "video/quicktime"),
+        ("zip", "application/zip"),
+        ("gz", "application/gzip"),
+        ("gltf", "model/gltf+json"),
+        ("glb", "model/gltf-binary"),
+    ];
+
+    #[test]
+    fn known_extensions_have_explicit_case_insensitive_mime_types() {
+        for &(extension, mime) in MIME_TYPES {
+            assert_eq!(get_mime_from_ext(Some(extension)), mime);
+            assert_eq!(
+                get_mime_from_ext(Some(&extension.to_ascii_uppercase())),
+                mime
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_missing_extensions_are_binary_instead_of_html() {
+        for extension in [
+            None,
+            Some(""),
+            Some("bin"),
+            Some("unknown"),
+            Some("com"),
+            Some("js/other"),
+        ] {
+            assert_eq!(get_mime_from_ext(extension), "application/octet-stream");
+        }
+    }
+
+    #[test]
+    fn android_response_mime_types_come_from_the_decoded_asset_path() {
+        for &(extension, mime) in MIME_TYPES {
+            for path in [
+                format!("/assets/an%20asset.{extension}"),
+                format!("/assets/an%20asset%2e{}", extension.to_ascii_uppercase()),
+                format!("an%20asset.{extension}"),
+            ] {
+                let response = resolve_android_asset(&path, |relative| {
+                    let name = relative.to_str().unwrap();
+                    assert!(name.starts_with("an asset."));
+                    assert!(!name.starts_with("assets/"));
+                    Some(b"Exact asset bytes.".to_vec())
+                })
+                .unwrap()
+                .into_response()
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], mime);
+                assert_eq!(response.body(), b"Exact asset bytes.");
+            }
+        }
+    }
+
+    #[test]
+    fn android_unknown_assets_are_binary_and_missing_assets_stay_missing() {
+        for path in ["/assets/file", "/assets/file.unknown", "/assets/file.bin"] {
+            let response = resolve_android_asset(path, |_| Some(b"Exact bytes.".to_vec()))
+                .unwrap()
+                .into_response()
+                .unwrap();
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/octet-stream"
+            );
+            assert!(resolve_android_asset(path, |_| None).is_none());
+        }
+    }
+
+    #[test]
+    fn android_malformed_paths_never_reach_the_asset_loader() {
+        for path in [
+            "/",
+            "/assets",
+            "/assets/../file.png",
+            "/assets/%2e%2e/file.ttf",
+            "/assets/file%00.woff",
+            "/assets/file%ff.png",
+        ] {
+            assert!(
+                resolve_android_asset(path, |_| panic!(
+                    "Malformed paths must not reach the asset loader."
+                ))
+                .is_none()
+            );
+        }
     }
 }

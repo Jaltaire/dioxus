@@ -207,7 +207,11 @@ impl App {
             show_devtools: false,
             tray_icon_show_window_on_click,
             dom_waker,
-            app_context: Rc::new(DesktopAppContext::new(proxy, event_loop.clone())),
+            app_context: Rc::new(DesktopAppContext::new(
+                proxy,
+                event_loop.clone(),
+                cfg.resource_response_policy.clone(),
+            )),
         };
 
         // Set the event converter

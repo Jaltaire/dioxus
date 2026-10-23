@@ -1,3 +1,4 @@
+use crate::RequestAsyncResponder;
 use crate::{
     AssetRequest, WindowCloseBehaviour, WindowConfig, WryEventHandler,
     assets::AssetHandlerRegistry,
@@ -21,7 +22,7 @@ use tao::{
     event_loop::EventLoopWindowTarget,
     window::{Fullscreen as WryFullscreen, Window, WindowId},
 };
-use wry::{RequestAsyncResponder, WebView};
+use wry::WebView;
 
 #[cfg(target_os = "ios")]
 use objc2::rc::Retained;
