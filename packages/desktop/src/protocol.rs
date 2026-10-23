@@ -1,3 +1,4 @@
+use crate::RequestAsyncResponder;
 use std::path::PathBuf;
 
 use crate::{assets::*, webview::WebviewEdits};
@@ -7,13 +8,10 @@ use dioxus_core::AnyhowContext;
 use dioxus_html::{SerializedFileData, SerializedFormObject};
 use dioxus_interpreter_js::NATIVE_JS;
 use dioxus_interpreter_js::unified_bindings::SLEDGEHAMMER_JS;
-use wry::{
-    RequestAsyncResponder,
-    http::{
-        HeaderValue, Request, Response,
-        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
-        status::StatusCode,
-    },
+use wry::http::{
+    HeaderValue, Request, Response,
+    header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
+    status::StatusCode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +80,7 @@ enum RequestOrigin {
 }
 
 impl RequestOrigin {
-    fn response(self, mut response: Response<Vec<u8>>) -> Response<Vec<u8>> {
+    fn response<T>(self, mut response: Response<T>) -> Response<T> {
         response.headers_mut().remove(ACCESS_CONTROL_ALLOW_ORIGIN);
         response
             .headers_mut()
@@ -120,6 +118,7 @@ pub(super) fn desktop_handler(
     custom_index: Option<String>,
     root_name: &str,
     headless: bool,
+    resource_response_policy: crate::resource_response::ResourceResponsePolicy,
 ) {
     let origin = match PageAddress::THIS_PLATFORM.request_origin(&request) {
         Ok(origin) => origin,
@@ -155,6 +154,19 @@ pub(super) fn desktop_handler(
         return;
     }
 
+    let path = request.uri().path().to_string();
+    let responder = resource_response_policy.responder(path, move |response| {
+        responder.respond(origin.response(response));
+    });
+
+    serve_asset_request(request, asset_handlers, responder);
+}
+
+fn serve_asset_request(
+    request: Request<Vec<u8>>,
+    asset_handlers: AssetHandlerRegistry,
+    responder: crate::RequestAsyncResponder,
+) {
     // todo: we want to move the custom assets onto a different protocol or something
     if let Some(name) = request.uri().path().split('/').nth(1) {
         if asset_handlers.has_handler(name) {
@@ -163,15 +175,23 @@ pub(super) fn desktop_handler(
         }
     }
 
-    match dioxus_asset_resolver::native::serve_asset(request.uri().path()) {
-        Ok(res) => responder.respond(origin.response(res)),
+    respond_to_asset(
+        dioxus_asset_resolver::native::serve_asset(request.uri().path()),
+        responder,
+    );
+}
+
+fn respond_to_asset(
+    response: Result<Response<Vec<u8>>, dioxus_asset_resolver::native::AssetServeError>,
+    responder: crate::RequestAsyncResponder,
+) {
+    match response {
+        Ok(res) => responder.respond(res),
         Err(_e) => responder.respond(
-            origin.response(
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(String::from("The asset could not be served.").into_bytes())
-                    .unwrap(),
-            ),
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(String::from("The asset could not be served.").into_bytes())
+                .unwrap(),
         ),
     }
 }
@@ -266,7 +286,7 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 
 fn file_dialog_responder_sync(
     request: wry::http::Request<Vec<u8>>,
-    responder: wry::RequestAsyncResponder,
+    responder: RequestAsyncResponder,
 ) -> dioxus_core::Result<()> {
     // Handle the file dialog request
     // We can't use the body, just the headers
@@ -299,7 +319,7 @@ fn file_dialog_responder_sync(
 fn respond_to_file_dialog(
     mut file_dialog: FileDialogRequest,
     file_list: Vec<PathBuf>,
-    responder: wry::RequestAsyncResponder,
+    responder: RequestAsyncResponder,
 ) -> dioxus_core::Result<()> {
     // Get the position of the entry we're updating, so we can insert new entries in the same place
     // If we can't find it, just append to the end. This is usually due to the input not being in a form element.
@@ -598,7 +618,7 @@ mod page_address_tests {
             .header(VARY, "Accept-Encoding")
             .body(Vec::new())
             .unwrap();
-        let response = RequestOrigin::Absent.response(response);
+        let response: Response<Vec<u8>> = RequestOrigin::Absent.response(response);
         assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
         let vary: Vec<_> = response
             .headers()
@@ -607,5 +627,420 @@ mod page_address_tests {
             .map(|value| value.to_str().unwrap())
             .collect();
         assert_eq!(vary, ["Accept-Encoding", "Origin"]);
+    }
+}
+
+#[cfg(test)]
+mod resource_response_tests {
+    use super::*;
+    use crate::{edits::EditWebsocket, resource_response::ResourceResponsePolicy};
+    use dioxus_core::{Callback, ScopeId, VirtualDom};
+    use std::{
+        borrow::Cow,
+        cell::RefCell,
+        rc::Rc,
+        sync::{Arc, Mutex, mpsc},
+    };
+
+    fn run_request(
+        path: &str,
+        policy: ResourceResponsePolicy,
+        handler: Option<impl Fn(AssetRequest, crate::RequestAsyncResponder) + 'static>,
+        event_data: Option<&[u8]>,
+    ) -> Response<Cow<'static, [u8]>> {
+        let dom = Rc::new(RefCell::new(VirtualDom::new(dioxus_core::VNode::empty)));
+        let handlers = AssetHandlerRegistry::new();
+        if let Some(handler) = handler {
+            dom.borrow().in_scope(ScopeId::ROOT, || {
+                handlers.register_handler(
+                    "assets".to_string(),
+                    Callback::new(move |(request, responder)| handler(request, responder)),
+                );
+            });
+        }
+        let edits = WebviewEdits::new(
+            dom.borrow().runtime(),
+            EditWebsocket::start().create_queue(),
+            Rc::downgrade(&dom),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let responder =
+            crate::RequestAsyncResponder::new(move |response| sender.send(response).unwrap());
+        let mut request = Request::builder()
+            .uri(format!("{}{path}", PageAddress::THIS_PLATFORM.index()))
+            .header(ORIGIN, PageAddress::THIS_PLATFORM.origin());
+        if let Some(event_data) = event_data {
+            request = request.header(
+                "dioxus-data",
+                base64::Engine::encode(&BASE64_STANDARD, event_data),
+            );
+        }
+        desktop_handler(
+            request.body(Vec::new()).unwrap(),
+            handlers,
+            responder,
+            &edits,
+            Some("<title>A custom page.</title>".to_string()),
+            Some(
+                "<html><head></head><body><main id=\"application\"></main></body></html>"
+                    .to_string(),
+            ),
+            "application",
+            false,
+            policy,
+        );
+        receiver.recv().unwrap()
+    }
+
+    fn without_handler() -> Option<fn(AssetRequest, crate::RequestAsyncResponder)> {
+        None
+    }
+
+    fn rejecting() -> ResourceResponsePolicy {
+        ResourceResponsePolicy {
+            verifier: Some(Arc::new(|_, _, _| false)),
+            required: true,
+        }
+    }
+
+    fn assert_packaged_headers(response: &Response<Cow<'static, [u8]>>) {
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+            PageAddress::THIS_PLATFORM.origin()
+        );
+        assert_eq!(response.headers()[VARY], "Origin");
+    }
+
+    #[test]
+    fn native_missing_executables_are_verified_after_the_asset_response_is_built() {
+        for extension in ["js", "mjs", "cjs", "wasm", "html", "xhtml", "svg", "css"] {
+            let path = format!("assets/missing-resource-verifier-test.{extension}");
+            for accepted in [false, true] {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let policy = ResourceResponsePolicy {
+                    verifier: Some(Arc::new({
+                        let seen = seen.clone();
+                        move |path, mime, bytes| {
+                            seen.lock().unwrap().push((
+                                path.to_string(),
+                                mime.map(str::to_string),
+                                bytes.to_vec(),
+                            ));
+                            accepted
+                        }
+                    })),
+                    required: true,
+                };
+                let response = run_request(&path, policy, without_handler(), None);
+                assert_eq!(
+                    response.status(),
+                    if accepted {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                assert_eq!(
+                    response.body().as_ref(),
+                    if accepted {
+                        b"Not Found".as_slice()
+                    } else {
+                        b"".as_slice()
+                    }
+                );
+                assert_packaged_headers(&response);
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    [(format!("/{path}"), None, b"Not Found".to_vec())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_success_and_serving_errors_cross_the_same_final_response_boundary() {
+        for succeeds in [false, true] {
+            for accepted in [false, true] {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let policy = ResourceResponsePolicy {
+                    verifier: Some(Arc::new({
+                        let seen = seen.clone();
+                        move |path, mime, bytes| {
+                            seen.lock().unwrap().push((
+                                path.to_string(),
+                                mime.map(str::to_string),
+                                bytes.to_vec(),
+                            ));
+                            accepted
+                        }
+                    })),
+                    required: true,
+                };
+                let (sender, receiver) = mpsc::channel();
+                let responder = policy.responder("/assets/code.js".to_string(), move |response| {
+                    sender.send(response).unwrap()
+                });
+                let native_response = if succeeds {
+                    Ok(Response::builder()
+                        .header("content-type", "text/javascript")
+                        .body(b"Exact asset bytes.".to_vec())
+                        .unwrap())
+                } else {
+                    Err(Response::builder()
+                        .status(0)
+                        .body(Vec::<u8>::new())
+                        .unwrap_err()
+                        .into())
+                };
+                respond_to_asset(native_response, responder);
+                let response = receiver.recv().unwrap();
+                let native_status = if succeeds {
+                    StatusCode::OK
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                let native_bytes = if succeeds {
+                    b"Exact asset bytes.".as_slice()
+                } else {
+                    b"The asset could not be served.".as_slice()
+                };
+                assert_eq!(
+                    response.status(),
+                    if accepted {
+                        native_status
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                assert_eq!(
+                    response.body().as_ref(),
+                    if accepted {
+                        native_bytes
+                    } else {
+                        b"".as_slice()
+                    }
+                );
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    [(
+                        "/assets/code.js".to_string(),
+                        succeeds.then(|| "text/javascript".to_string()),
+                        native_bytes.to_vec()
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_executable_responses_fail_closed_when_the_required_verifier_is_missing() {
+        let response = run_request(
+            "assets/missing-resource-verifier-test.js",
+            ResourceResponsePolicy {
+                required: true,
+                ..Default::default()
+            },
+            without_handler(),
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.body().is_empty());
+        assert_packaged_headers(&response);
+    }
+
+    #[test]
+    fn custom_callbacks_cannot_bypass_the_final_verifier_on_success_redirect_or_error() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::FOUND,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            for mime in [
+                "text/javascript",
+                "application/wasm",
+                "text/html",
+                "application/xhtml+xml",
+                "image/svg+xml",
+                "text/css",
+            ] {
+                let response = run_request(
+                    "assets/custom.bin",
+                    rejecting(),
+                    Some(move |_, responder: crate::RequestAsyncResponder| {
+                        responder.respond(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", mime)
+                                .header("location", "/assets/fallback.js")
+                                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                .body(b"Custom bytes.".as_slice())
+                                .unwrap(),
+                        );
+                    }),
+                    None,
+                );
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(response.body().is_empty());
+                assert!(!response.headers().contains_key("location"));
+                assert_packaged_headers(&response);
+            }
+        }
+    }
+
+    #[test]
+    fn a_custom_callback_has_no_native_fallback_after_verification_denies_it() {
+        let response = run_request(
+            "assets/missing-resource-verifier-test.js",
+            rejecting(),
+            Some(|_, responder: crate::RequestAsyncResponder| {
+                responder.respond(Response::new(b"Custom bytes.".to_vec()));
+            }),
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.body().is_empty());
+    }
+
+    #[test]
+    fn custom_callback_bytes_are_verified_after_owned_and_borrowed_responses() {
+        for owned in [false, true] {
+            let policy = ResourceResponsePolicy {
+                verifier: Some(Arc::new(|path, mime, bytes| {
+                    path == "/assets/custom%2ejs"
+                        && mime == Some("text/javascript")
+                        && bytes == b"Custom bytes."
+                })),
+                required: true,
+            };
+            let response = run_request(
+                "assets/custom%2ejs",
+                policy,
+                Some(
+                    move |request: AssetRequest, responder: crate::RequestAsyncResponder| {
+                        assert_eq!(request.uri().path(), "/assets/custom%2ejs");
+                        let bytes = if owned {
+                            Cow::Owned(b"Custom bytes.".to_vec())
+                        } else {
+                            Cow::Borrowed(b"Custom bytes.".as_slice())
+                        };
+                        responder.respond(
+                            Response::builder()
+                                .header("content-type", "text/javascript")
+                                .header("cache-control", "public, max-age=1000")
+                                .body(bytes)
+                                .unwrap(),
+                        );
+                    },
+                ),
+                None,
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.body().as_ref(), b"Custom bytes.");
+            assert_packaged_headers(&response);
+        }
+    }
+
+    #[test]
+    fn custom_executables_require_a_verifier_but_default_optional_mode_preserves_callbacks() {
+        for required in [false, true] {
+            let response = run_request(
+                "assets/custom.bin",
+                ResourceResponsePolicy {
+                    required,
+                    ..Default::default()
+                },
+                Some(|_, responder: crate::RequestAsyncResponder| {
+                    responder.respond(
+                        Response::builder()
+                            .status(StatusCode::CREATED)
+                            .header("content-type", "text/javascript")
+                            .body(b"Custom bytes.".as_slice())
+                            .unwrap(),
+                    );
+                }),
+                None,
+            );
+            assert_eq!(
+                response.status(),
+                if required {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::CREATED
+                }
+            );
+            assert_eq!(
+                response.body().as_ref(),
+                if required {
+                    b"".as_slice()
+                } else {
+                    b"Custom bytes.".as_slice()
+                }
+            );
+            assert_packaged_headers(&response);
+        }
+    }
+
+    #[test]
+    fn malformed_paths_cannot_bypass_verification_through_custom_callbacks() {
+        for path in [
+            "assets/%2e%2e/code.js",
+            "assets/code%00.js",
+            "assets/code%ff.js",
+            "assets/code%2g.js",
+        ] {
+            let response = run_request(
+                path,
+                ResourceResponsePolicy {
+                    verifier: Some(Arc::new(|_, _, _| {
+                        panic!("Malformed paths must not reach the verifier.")
+                    })),
+                    required: true,
+                },
+                Some(|_, responder: crate::RequestAsyncResponder| {
+                    responder.respond(Response::new(b"Custom bytes.".as_slice()));
+                }),
+                None,
+            );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(response.body().is_empty());
+            assert_packaged_headers(&response);
+        }
+    }
+
+    #[test]
+    fn generated_bootstrap_html_stays_outside_packaged_verification() {
+        let policy = ResourceResponsePolicy {
+            verifier: Some(Arc::new(|_, _, _| {
+                panic!("The generated bootstrap must not reach the packaged verifier.")
+            })),
+            required: true,
+        };
+        let response = run_request("", policy, without_handler(), None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/html");
+        let body = std::str::from_utf8(response.body()).unwrap();
+        assert!(body.contains("<title>A custom page.</title>"));
+        assert!(body.contains("getElementById(\"application\")"));
+        assert!(body.contains("new NativeInterpreter("));
+        assert!(body.contains("waitForRequest("));
+    }
+
+    #[test]
+    fn event_ipc_stays_outside_packaged_verification() {
+        let policy = ResourceResponsePolicy {
+            verifier: Some(Arc::new(|_, _, _| {
+                panic!("Event IPC must not reach the packaged verifier.")
+            })),
+            required: true,
+        };
+        let response = run_request("__events", policy, without_handler(), Some(b"null"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(response.body()).unwrap(),
+            serde_json::json!({"preventDefault": false})
+        );
     }
 }

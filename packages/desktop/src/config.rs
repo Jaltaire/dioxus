@@ -62,6 +62,7 @@ pub struct Config {
     pub(crate) pre_rendered: Option<String>,
     pub(crate) disable_context_menu: bool,
     pub(crate) resource_dir: Option<PathBuf>,
+    pub(crate) resource_response_policy: crate::resource_response::ResourceResponsePolicy,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) custom_head: Option<String>,
     pub(crate) custom_index: Option<String>,
@@ -117,6 +118,7 @@ impl Config {
             pre_rendered: None,
             disable_context_menu: !cfg!(debug_assertions),
             resource_dir: None,
+            resource_response_policy: Default::default(),
             data_dir: None,
             custom_head: None,
             custom_index: None,
@@ -138,6 +140,21 @@ impl Config {
     /// set the directory from which assets will be searched in release mode
     pub fn with_resource_directory(mut self, path: impl Into<PathBuf>) -> Self {
         self.resource_dir = Some(path.into());
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn with_resource_response_verifier(
+        mut self,
+        verifier: Arc<dyn Fn(&str, Option<&str>, &[u8]) -> bool + Send + Sync>,
+    ) -> Self {
+        self.resource_response_policy.verifier = Some(verifier);
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn with_resource_response_verifier_required(mut self, required: bool) -> Self {
+        self.resource_response_policy.required = required;
         self
     }
 

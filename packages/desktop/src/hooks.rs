@@ -6,9 +6,9 @@ use crate::{
 };
 use dioxus_core::{Runtime, consume_context, use_hook, use_hook_with_cleanup};
 
+use crate::RequestAsyncResponder;
 use dioxus_hooks::use_callback;
 use tao::{event::Event, event_loop::EventLoopWindowTarget};
-use wry::RequestAsyncResponder;
 
 /// Get an imperative handle to the current window
 pub fn use_window() -> DesktopContext {

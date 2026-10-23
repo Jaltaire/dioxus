@@ -37,7 +37,11 @@ pub(crate) fn answered_in_its_frame(name: &str) -> bool {
 }
 
 impl WebviewEdits {
-    fn new(runtime: Rc<Runtime>, wry_queue: WryQueue, dom: Weak<RefCell<VirtualDom>>) -> Self {
+    pub(crate) fn new(
+        runtime: Rc<Runtime>,
+        wry_queue: WryQueue,
+        dom: Weak<RefCell<VirtualDom>>,
+    ) -> Self {
         Self {
             runtime,
             wry_queue,
@@ -67,7 +71,7 @@ impl WebviewEdits {
     pub fn handle_event(
         &self,
         request: wry::http::Request<Vec<u8>>,
-        responder: wry::RequestAsyncResponder,
+        responder: crate::RequestAsyncResponder,
     ) {
         let body = self
             .try_handle_event(request)
@@ -317,6 +321,7 @@ impl WebviewInstance {
                 cfg.custom_head,
                 cfg.custom_index,
                 cfg.root_name,
+                cfg.resource_response_policy,
                 asset_handlers,
                 edits
             ];
@@ -338,12 +343,13 @@ impl WebviewInstance {
                 protocol::desktop_handler(
                     request,
                     asset_handlers.clone(),
-                    responder,
+                    crate::RequestAsyncResponder::new(move |response| responder.respond(response)),
                     &edits,
                     custom_head.clone(),
                     custom_index.clone(),
                     &root_name,
                     headless,
+                    resource_response_policy.clone(),
                 )
             }
         };

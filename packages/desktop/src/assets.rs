@@ -1,10 +1,31 @@
 use dioxus_core::Callback;
 use rustc_hash::FxHashMap;
-use std::{cell::RefCell, rc::Rc};
-use wry::{RequestAsyncResponder, http::Request};
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
+use wry::http::{Request, Response};
 
 /// A request for an asset within dioxus-desktop.
 pub type AssetRequest = Request<Vec<u8>>;
+
+#[allow(missing_docs)]
+pub struct RequestAsyncResponder {
+    responder: Box<dyn FnOnce(Response<Cow<'static, [u8]>>) + Send>,
+}
+
+impl RequestAsyncResponder {
+    pub(crate) fn new(
+        responder: impl FnOnce(Response<Cow<'static, [u8]>>) + Send + 'static,
+    ) -> Self {
+        Self {
+            responder: Box::new(responder),
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn respond<T: Into<Cow<'static, [u8]>>>(self, response: Response<T>) {
+        let (parts, body) = response.into_parts();
+        (self.responder)(Response::from_parts(parts, body.into()));
+    }
+}
 
 pub struct AssetHandler {
     f: Callback<(AssetRequest, RequestAsyncResponder)>,
