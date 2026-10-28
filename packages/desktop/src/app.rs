@@ -416,7 +416,8 @@ impl App {
         }
     }
 
-    /// The process drawing a window's page has been terminated by the platform.
+    /// The process drawing a window's page has been terminated by the platform,
+    /// or the activity holding it has been created again.
     ///
     /// The application itself is untouched -- its state, its tasks and its
     /// virtual dom are all still here -- but the page they were being drawn
@@ -426,6 +427,8 @@ impl App {
     /// into it from the virtual dom that never went anywhere.
     ///
     /// iOS does this to an application that has been in the background a while.
+    /// Android creates an activity again, and a new web view with it, to show a
+    /// configuration change the activity does not handle itself.
     ///
     /// The load is not trusted to finish. When the platform has taken the
     /// networking process along with the web content process, or the GPU

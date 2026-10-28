@@ -30,8 +30,9 @@ pub enum UserWindowEvent {
     Poll(WindowId),
 
     /// This window's page is lost - the process drawing it was terminated
-    /// by the platform, or the page is on screen showing nothing of what the
-    /// virtual dom holds - and has to be loaded again.
+    /// by the platform, the activity holding it was created again, or the
+    /// page is on screen showing nothing of what the virtual dom holds - and
+    /// has to be loaded again.
     PageLost(WindowId),
 
     /// The time a lost page was given to load again is up. If the page has

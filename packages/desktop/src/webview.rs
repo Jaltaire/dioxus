@@ -501,15 +501,19 @@ impl WebviewInstance {
             let page_loaded = page_loaded.clone();
             let page_awaited = page_awaited.clone();
             let (proxy, window_id) = (shared.proxy.to_owned(), window.id());
-            webview = webview.with_on_render_process_gone_handler(move |gone| {
-                match gone {
-                    wry::RenderProcessGone::Crashed => tracing::warn!(
+            webview = webview.with_on_page_lost_handler(move |lost| {
+                match lost {
+                    wry::PageLost::RenderProcessCrashed => tracing::warn!(
                         "The web view's renderer process crashed. The page will be loaded again so \
                          the application can come back."
                     ),
-                    wry::RenderProcessGone::Killed => tracing::warn!(
+                    wry::PageLost::RenderProcessKilled => tracing::warn!(
                         "The web view's renderer process was ended by the system. The page will be \
                          loaded again so the application can come back."
+                    ),
+                    wry::PageLost::ActivityRecreated => tracing::info!(
+                        "The activity was created again, and its web view with it. The page will \
+                         be loaded again so the application can come back."
                     ),
                 }
                 page_awaited.store(true, std::sync::atomic::Ordering::SeqCst);
