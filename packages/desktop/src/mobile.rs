@@ -24,28 +24,26 @@ pub extern "C" fn start_app() {
     // panic into a confusing `PoisonError` at the next JNI callback. Initialize it here
     // before handing off to wry's own setup.
     //
-    // Guarded by `Once` because `WryActivity.onCreate` (and therefore this setup) runs
-    // again on activity re-creation — rotation, theme changes, back/foreground cycles —
-    // and `ndk_context::initialize_android_context` asserts `previous.is_none()`, which
-    // would abort the process on every re-entry. The global only needs the JavaVM + an
-    // activity-like Context pointer for consumers to attach a JNI thread; we don't need
-    // to refresh it per-activity.
+    // `WryActivity.onCreate` (and therefore this setup) runs again on activity re-creation —
+    // rotation, theme changes, back/foreground cycles — and the previous activity's reference is
+    // deleted with it. The context is therefore published again for every activity, from a
+    // reference of its own held until the next one replaces it, so consumers are never handed
+    // the deleted one.
     unsafe fn android_setup(
         package: &str,
         env: ::wry::prelude::JNIEnv<'_>,
         looper: &::ndk::looper::ThreadLooper,
         activity: ::wry::prelude::GlobalRef,
     ) {
-        static NDK_CONTEXT_INIT: std::sync::Once = std::sync::Once::new();
-        NDK_CONTEXT_INIT.call_once(|| {
-            let vm = env.get_java_vm().unwrap();
-            unsafe {
-                ::ndk_context::initialize_android_context(
-                    vm.get_java_vm_pointer() as *mut _,
-                    activity.as_obj().as_raw() as *mut _,
-                );
-            }
-        });
+        static ACTIVITY: crate::android_context::CurrentContext<::wry::prelude::GlobalRef> =
+            crate::android_context::CurrentContext::new();
+        let vm = env.get_java_vm().unwrap();
+        let held = env.new_global_ref(activity.as_obj()).unwrap();
+        unsafe {
+            ACTIVITY.publish(vm.get_java_vm_pointer() as *mut _, held, |held| {
+                held.as_obj().as_raw() as *mut _
+            });
+        }
         unsafe {
             wry::android_setup(package, env, looper, activity);
         }

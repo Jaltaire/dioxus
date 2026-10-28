@@ -5,6 +5,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(unexpected_cfgs)]
 
+#[cfg(any(target_os = "android", test))]
+mod android_context;
 mod android_sync_lock;
 mod app;
 mod assets;
