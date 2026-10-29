@@ -28,7 +28,8 @@ pub extern "C" fn start_app() {
     // rotation, theme changes, back/foreground cycles — and the previous activity's reference is
     // deleted with it. The context published is therefore the application's, which outlives every
     // activity: it is published once, from a reference held for the life of the process, and never
-    // cleared, so no consumer can find it missing or deleted.
+    // cleared, so no consumer can find it missing or deleted. Each activity created is recorded
+    // with manganis, which holds it weakly and hands it out only while it has not been destroyed.
     unsafe fn android_setup(
         package: &str,
         mut env: ::wry::prelude::JNIEnv<'_>,
@@ -56,6 +57,9 @@ pub extern "C" fn start_app() {
                 },
                 |held| held.as_obj().as_raw() as *mut _,
             );
+        }
+        if let Err(error) = manganis::android::activity_created(&env, activity.as_obj()) {
+            tracing::warn!("The activity created could not be recorded for manganis: {error}");
         }
         unsafe {
             wry::android_setup(package, env, looper, activity);

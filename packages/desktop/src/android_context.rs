@@ -11,7 +11,8 @@ use std::sync::OnceLock;
 /// leaves a moment in which a consumer on another thread finds none and panics, and a consumer
 /// still holding the previous activity's reference aborts once it is deleted. The application
 /// outlives every activity, so its context is published once, never cleared, and never deleted.
-/// A consumer that needs an activity rather than a context has to find the current one itself.
+/// A consumer that needs an activity rather than a context finds the one alive through
+/// manganis's `with_activity`, which every activity created is recorded with.
 pub(crate) struct ApplicationContext<H> {
     held: OnceLock<H>,
 }

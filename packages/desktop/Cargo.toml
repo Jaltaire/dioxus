@@ -78,6 +78,7 @@ objc2-ui-kit = { workspace = true, features = ["UIView", "UIViewController"] }
 [target.'cfg(target_os = "android")'.dependencies]
 tungstenite = { workspace = true, features = ["rustls"] }
 jni = "0.21.1"
+manganis = { workspace = true }
 ndk = { version = "0.9.0" }
 ndk-sys = { version = "0.6.0" }
 ndk-context = { version = "0.1.1" }
