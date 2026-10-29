@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     {{#each gradle_plugins}}
     id("{{ this }}")
     {{/each}}
@@ -50,8 +49,10 @@ android {
             )
         }
     }
-    kotlinOptions {
-        jvmTarget = "17"
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -62,7 +63,7 @@ android {
     }
     sourceSets {
         getByName("main") {
-            java.srcDirs("src/main/kotlin", "src/main/java")
+            java.directories += listOf("src/main/kotlin", "src/main/java")
         }
     }
 }
