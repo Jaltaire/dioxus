@@ -473,31 +473,25 @@ impl EditWebsocket {
         // Handle the websocket connection in a separate thread
         let (edits_outgoing, edits_incoming_rx) = std::sync::mpsc::channel::<MsgPair>();
 
-        let admission = connections
-            .write()
-            .unwrap()
-            .get_mut(&location.webview_id)
-            .map(|pages| {
-                pages.connect(
-                    page,
-                    Connection {
-                        edits_outgoing,
-                        number: connection_number,
-                    },
-                )
-            })
-            .unwrap_or(Admission::Replaced);
-
         // Immediately send the key to authenticate the server
-        if let Err(error) =
-            websocket.send(tungstenite::Message::Text(hex_encoded_server_key.into()))
-        {
-            tracing::error!("Error authenticating the edits connection to the webview: {error}");
-            if let Some(pages) = connections.write().unwrap().get_mut(&location.webview_id) {
-                pages.disconnect(page, connection_number, None);
+        let admission = match admit(
+            &connections,
+            location.webview_id,
+            page,
+            Connection {
+                edits_outgoing,
+                number: connection_number,
+            },
+            || websocket.send(tungstenite::Message::Text(hex_encoded_server_key.into())),
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::error!(
+                    "Error authenticating the edits connection to the webview: {error}"
+                );
+                return;
             }
-            return;
-        }
+        };
 
         match admission {
             Admission::Drawn => tracing::debug!(
@@ -589,7 +583,15 @@ impl EditWebsocket {
                 .write()
                 .unwrap()
                 .get_mut(&location.webview_id)
-                .is_some_and(|pages| pages.disconnect(page, connection_number, queued_message));
+                .is_some_and(|pages| {
+                    pages.disconnect(
+                        page,
+                        connection_number,
+                        queued_message
+                            .into_iter()
+                            .chain(edits_incoming_rx.try_iter()),
+                    )
+                });
             tracing::debug!(
                 "Edits connection {connection_number} of page {page} of webview {} ended; the \
                  table {} refers to it.",
@@ -626,6 +628,28 @@ impl EditWebsocket {
             },
         }
     }
+}
+
+/// Sends the server's key with `authenticate`, and admits `connection` for
+/// `page` of `webview` only once the key has been sent.
+///
+/// An admitted connection is handed whatever was waiting for its page, so a
+/// connection that cannot even be sent the key is never admitted, and what
+/// was waiting stays waiting for the next.
+fn admit<E>(
+    connections: &RwLock<HashMap<u32, WebviewPages>>,
+    webview: u32,
+    page: Page,
+    connection: Connection,
+    authenticate: impl FnOnce() -> Result<(), E>,
+) -> Result<Admission, E> {
+    authenticate()?;
+    Ok(connections
+        .write()
+        .unwrap()
+        .get_mut(&webview)
+        .map(|pages| pages.connect(page, connection))
+        .unwrap_or(Admission::Replaced))
 }
 
 /// Closes the connection of a page that has been replaced, with the code
@@ -760,10 +784,19 @@ impl WebviewPages {
     }
 
     /// A connection's thread has ended. If the table still refers to it, the
-    /// page is left to connect again and the edits it owed are sent first
-    /// when it does; otherwise the connection was replaced, and what it owed
-    /// is dropped with it.
-    fn disconnect(&mut self, page: Page, number: u64, owed: Option<MsgPair>) -> bool {
+    /// page is left to connect again, and the edits it owed are sent first
+    /// when it does, in the order they were owed; otherwise the connection
+    /// was replaced, and what it owed is dropped with it.
+    ///
+    /// What a connection owes is the edits it was sending when it ended and
+    /// every edit still waiting in it, which are taken only once the table
+    /// has let go of it, so that nothing more can be handed to it.
+    fn disconnect(
+        &mut self,
+        page: Page,
+        number: u64,
+        owed: impl IntoIterator<Item = MsgPair>,
+    ) -> bool {
         if !self
             .connections
             .get(&page)
@@ -772,7 +805,11 @@ impl WebviewPages {
             return false;
         }
         self.connections.remove(&page);
-        if let Some(owed) = owed.filter(|owed| self.drawn == Some(owed.page)) {
+        let owed: Vec<MsgPair> = owed
+            .into_iter()
+            .filter(|owed| self.drawn == Some(owed.page))
+            .collect();
+        for owed in owed.into_iter().rev() {
             self.pending.push_front(owed);
         }
         true
@@ -1074,6 +1111,136 @@ mod page_tests {
         let (again, incoming) = connection(8);
         assert_eq!(pages.connect(Page(1), again), Admission::Drawn);
         assert_eq!(heard(&incoming), [b"owed".to_vec(), b"after".to_vec()]);
+    }
+
+    #[test]
+    fn a_connection_that_ends_gives_back_everything_still_waiting_in_it_in_order() {
+        let mut pages = WebviewPages::default();
+        assert_eq!(pages.report_in(Page(1)), Arrival::Drawn);
+        let waiting: Vec<_> = [b"rebuild".as_slice(), b"diff", b"another diff"]
+            .into_iter()
+            .map(|edits| pages.write(edits.to_vec()).expect("A page is drawn into."))
+            .collect();
+        let (page_one, incoming) = connection(3);
+        assert_eq!(pages.connect(Page(1), page_one), Admission::Drawn);
+        let sending = incoming
+            .recv()
+            .expect("The connection is handed what waited.");
+        assert_eq!(sending.edits, b"rebuild");
+
+        assert!(pages.disconnect(
+            Page(1),
+            3,
+            Some(sending).into_iter().chain(incoming.try_iter())
+        ));
+        assert_eq!(
+            pages
+                .pending
+                .iter()
+                .map(|pair| pair.edits.clone())
+                .collect::<Vec<_>>(),
+            [
+                b"rebuild".to_vec(),
+                b"diff".to_vec(),
+                b"another diff".to_vec()
+            ]
+        );
+        for mut applied in waiting {
+            assert_eq!(
+                applied.try_recv(),
+                Ok(None),
+                "Edits given back are still awaited, never cancelled."
+            );
+        }
+
+        let (again, incoming) = connection(4);
+        assert_eq!(pages.connect(Page(1), again), Admission::Drawn);
+        assert_eq!(
+            heard(&incoming),
+            [
+                b"rebuild".to_vec(),
+                b"diff".to_vec(),
+                b"another diff".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_connection_that_cannot_be_sent_the_key_takes_nothing_waiting_for_its_page() {
+        let connections = RwLock::new(HashMap::from([(0, WebviewPages::default())]));
+        let mut applied = {
+            let mut table = connections.write().unwrap();
+            let pages = table.get_mut(&0).unwrap();
+            assert_eq!(pages.report_in(Page(1)), Arrival::Drawn);
+            pages
+                .write(b"rebuild".to_vec())
+                .expect("A page is drawn into.")
+        };
+
+        let (refused, refused_incoming) = connection(0);
+        assert_eq!(
+            admit(&connections, 0, Page(1), refused, || Err(
+                "The page went away."
+            )),
+            Err("The page went away.")
+        );
+        assert!(heard(&refused_incoming).is_empty());
+        {
+            let table = connections.read().unwrap();
+            let pages = &table[&0];
+            assert!(!pages.connections.contains_key(&Page(1)));
+            assert_eq!(pages.pending.len(), 1);
+        }
+        assert_eq!(
+            applied.try_recv(),
+            Ok(None),
+            "The rebuild is still awaited, never cancelled."
+        );
+
+        let (admitted, incoming) = connection(1);
+        assert_eq!(
+            admit(&connections, 0, Page(1), admitted, || Ok::<(), &str>(())),
+            Ok(Admission::Drawn)
+        );
+        assert_eq!(heard(&incoming), [b"rebuild".to_vec()]);
+    }
+
+    #[test]
+    fn a_connection_whose_key_is_sent_is_admitted_as_its_page_stands() {
+        let connections = RwLock::new(HashMap::from([(0, WebviewPages::default())]));
+        let mut sent = 0;
+        let (held, _) = connection(0);
+        assert_eq!(
+            admit(&connections, 0, Page(1), held, || {
+                sent += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(Admission::Held)
+        );
+        connections
+            .write()
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .report_in(Page(2));
+        let (replaced, _) = connection(1);
+        assert_eq!(
+            admit(&connections, 0, Page(1), replaced, || {
+                sent += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(Admission::Replaced)
+        );
+        let (unknown, _) = connection(2);
+        assert_eq!(
+            admit(&connections, 7, Page(1), unknown, || {
+                sent += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(Admission::Replaced),
+            "A connection for a webview that does not exist is refused."
+        );
+        assert_eq!(sent, 3, "Every connection is sent the key, refused or not.");
     }
 
     #[test]
