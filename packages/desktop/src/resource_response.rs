@@ -6,6 +6,10 @@ use wry::http::{
 
 type ResourceResponseVerifier = Arc<dyn Fn(&str, Option<&str>, &[u8]) -> bool + Send + Sync>;
 
+/// The cache policy of everything the page is served: every response is
+/// built for the page that asked for it, so none is ever kept for another.
+pub(crate) const UNCACHED: &str = "no-store";
+
 #[derive(Clone, Default)]
 pub(crate) struct ResourceResponsePolicy {
     pub(crate) verifier: Option<ResourceResponseVerifier>,
@@ -41,7 +45,7 @@ impl ResourceResponsePolicy {
         }
         response
             .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            .insert(CACHE_CONTROL, HeaderValue::from_static(UNCACHED));
         response
             .headers_mut()
             .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));

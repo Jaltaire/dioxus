@@ -10,7 +10,7 @@ use dioxus_interpreter_js::NATIVE_JS;
 use dioxus_interpreter_js::unified_bindings::SLEDGEHAMMER_JS;
 use wry::http::{
     HeaderValue, Request, Response,
-    header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
+    header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, ORIGIN, VARY},
     status::StatusCode,
 };
 
@@ -237,6 +237,7 @@ fn index_request(
 
     Response::builder()
         .header("Content-Type", "text/html")
+        .header(CACHE_CONTROL, crate::resource_response::UNCACHED)
         .body(index.into())
         .ok()
 }
@@ -1029,6 +1030,27 @@ mod resource_response_tests {
         assert!(body.contains("getElementById(\"application\")"));
         assert!(body.contains("new NativeInterpreter("));
         assert!(body.contains("waitForRequest("));
+    }
+
+    #[test]
+    fn the_index_is_never_kept_by_a_cache_since_each_one_served_names_a_page_of_its_own() {
+        for policy in [ResourceResponsePolicy::default(), rejecting()] {
+            let response = run_request("", policy, without_handler(), None);
+            assert_eq!(response.status(), StatusCode::OK);
+            let cached: Vec<&str> = response
+                .headers()
+                .get_all(CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(cached, [crate::resource_response::UNCACHED]);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            let body = std::str::from_utf8(response.body()).unwrap();
+            assert!(
+                body.contains("new NativeInterpreter(\"") && body.contains("{ page: 1 }"),
+                "The index names the page it was served as: {body}"
+            );
+        }
     }
 
     #[test]
