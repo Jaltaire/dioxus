@@ -646,8 +646,8 @@ impl FfiBridgeParser {
 
         quote! {
             pub fn #fn_name(#(#rust_args),*) -> Result<#return_type, String> {
-                // Use with_activity which returns Option<R>, wrapping our Result in the Option
-                let inner_result: Option<Result<#return_type, String>> = manganis::android::with_activity(|mut env, _activity| {
+                // Use with_context which returns Option<R>, wrapping our Result in the Option
+                let inner_result: Option<Result<#return_type, String>> = manganis::android::with_context(|mut env, _context| {
                     // Define result conversion as a local function to avoid closure capture issues
                     #result_conversion_fn
 
@@ -1093,4 +1093,56 @@ fn to_camel_case(s: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FfiAttribute, FfiBridgeParser};
+
+    fn generated(declarations: &str) -> String {
+        let item = syn::parse_str(declarations).expect("The declarations parse.");
+        FfiBridgeParser::parse_with_attr(
+            FfiAttribute {
+                source_path: "src/android".to_owned(),
+            },
+            item,
+        )
+        .expect("The bridge parses.")
+        .generate()
+        .to_string()
+    }
+
+    #[test]
+    fn a_kotlin_plugin_is_made_with_the_activity_and_called_with_the_published_context() {
+        let generated = generated(
+            "extern \"Kotlin\" {\n    type Plugin;\n    fn greet(this: &Plugin, name: String) -> String;\n    fn count(this: &Plugin) -> i32;\n}",
+        );
+        assert_eq!(
+            generated
+                .matches("manganis :: android :: with_activity")
+                .count(),
+            1,
+            "Only making the plugin, which takes the activity, asks for one: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("manganis :: android :: with_context")
+                .count(),
+            2,
+            "Every call on the plugin is made with the published context: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_kotlin_bridge_without_types_never_asks_for_an_activity() {
+        let generated = generated("extern \"Kotlin\" {\n    fn version() -> String;\n}");
+        assert!(!generated.contains("with_activity"), "{generated}");
+        assert_eq!(
+            generated
+                .matches("manganis :: android :: with_context")
+                .count(),
+            1,
+            "{generated}"
+        );
+    }
 }
