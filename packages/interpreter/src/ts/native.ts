@@ -11,6 +11,8 @@ import { SerializedEvent, serializeEvent, SerializedFileData, extractSerializedF
 // we're going to bind the JSChannel_ object to the JSChannel object, and then extend it
 var JSChannel_: typeof BaseInterpreter;
 
+const PAGE_REPLACED = 4001;
+
 // @ts-ignore - this is coming from the host
 if (RawInterpreter !== undefined && RawInterpreter !== null) {
   // @ts-ignore - this is coming from the host
@@ -24,6 +26,7 @@ export class NativeInterpreter extends JSChannel_ {
   baseUri: string;
   eventsPath: string;
   headless: boolean;
+  page: number;
   kickStylesheets: boolean;
   queuedBytes: ArrayBuffer[] = [];
 
@@ -31,12 +34,13 @@ export class NativeInterpreter extends JSChannel_ {
   // however, for now we need to support it since WebSockets in fullstack doesn't exist yet
   liveview: boolean;
 
-  constructor(baseUri: string, headless: boolean) {
+  constructor(baseUri: string, headless: boolean, page: number) {
     super();
     this.baseUri = baseUri;
     this.eventsPath = `${baseUri}/__events`;
     this.kickStylesheets = false;
     this.headless = headless;
+    this.page = page;
   }
 
   initialize(root: HTMLElement): void {
@@ -416,7 +420,11 @@ export class NativeInterpreter extends JSChannel_ {
       this.sendIpcMessage("user_event", body);
     } else {
       // Run the event handler on the virtualdom
-      return handleVirtualdomEventSync(this.eventsPath, JSON.stringify(body));
+      return handleVirtualdomEventSync(
+        this.eventsPath,
+        JSON.stringify(body),
+        this.page
+      );
     }
   }
 
@@ -479,15 +487,20 @@ export class NativeInterpreter extends JSChannel_ {
   }
 
   waitForRequest(editsPath: string, required_server_key: string) {
-    this.edits = new WebSocket(editsPath);
+    const editsUrl = `${editsPath}/${this.page}`;
+    this.edits = new WebSocket(editsUrl);
     // Only trust the websocket once it sends us the required server key
     let authenticated = false;
-    // Reconnect if the websocket closes. This may happen on ios when the app is suspended
+    // Reconnect if the websocket closes, unless it was closed because this page has been
+    // replaced. A close may happen on ios when the app is suspended
     // in the background: https://github.com/DioxusLabs/dioxus/issues/4374
-    this.edits.onclose = () => {
+    this.edits.onclose = (event: CloseEvent) => {
+      if (event.code === PAGE_REPLACED) {
+        return;
+      }
       setTimeout(() => {
         // If the edits path has changed, we don't want to reconnect to the old one
-        if (this.edits.url != editsPath) {
+        if (this.edits.url != editsUrl) {
           return;
         }
         this.waitForRequest(editsPath, required_server_key);
@@ -587,7 +600,8 @@ type EventSyncResult = {
 // Liveview is a little bit of a tricky beast
 function handleVirtualdomEventSync(
   endpoint: string,
-  contents: string
+  contents: string,
+  page: number
 ): EventSyncResult {
   // Handle the event on the virtualdom and then process whatever its output was
   const xhr = new XMLHttpRequest();
@@ -606,6 +620,7 @@ function handleVirtualdomEventSync(
   const contents_bytes = new TextEncoder().encode(contents);
   const contents_base64 = btoa(String.fromCharCode.apply(null, contents_bytes));
   xhr.setRequestHeader("dioxus-data", contents_base64);
+  xhr.setRequestHeader("dioxus-page", String(page));
   xhr.send();
 
   // Deserialize the response, and then prevent the default/capture the event if the virtualdom wants to

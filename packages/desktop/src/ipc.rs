@@ -79,6 +79,12 @@ pub struct IpcMessage {
     params: serde_json::Value,
 }
 
+/// What a page says when it reports in: which page it is.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageReport {
+    pub(crate) page: crate::edits::Page,
+}
+
 /// A set of known messages that we need to respond to
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum IpcMethod<'a> {

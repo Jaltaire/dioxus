@@ -103,12 +103,33 @@ impl WebviewEdits {
         let data_from_header = base64::Engine::decode(&BASE64_STANDARD, as_utf)
             .map_err(|_| Error::custom("dioxus-data header is not a base64 string"))?;
 
+        let page = request
+            .headers()
+            .get(crate::edits::PAGE_HEADER)
+            .and_then(|page| page.to_str().ok())
+            .and_then(|page| page.parse::<crate::edits::Page>().ok());
+
         let response = match serde_json::from_slice(&data_from_header) {
             Ok(event) => {
                 // we need to wait for the mutex lock to let us munge the main thread..
                 #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
-                self.handle_html_event(event)
+                match page {
+                    Some(page) if self.wry_queue.is_drawn(page) => self.handle_html_event(event),
+                    Some(page) => {
+                        tracing::info!(
+                            "An event from page {page}, which is not the page being drawn into, \
+                             is dropped."
+                        );
+                        SynchronousEventResponse::new(false)
+                    }
+                    None => {
+                        tracing::warn!(
+                            "An event that does not name the page it came from is dropped."
+                        );
+                        SynchronousEventResponse::new(false)
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(
@@ -133,22 +154,24 @@ impl WebviewEdits {
             bubbles,
             data,
         } = event;
-        let Some(desktop_context) = self.desktop_context.get() else {
-            tracing::error!(
-                "Tried to handle event before setting the desktop context on the event handler"
-            );
-            return Default::default();
+        let desktop_context = || {
+            let Some(desktop_context) = self.desktop_context.get() else {
+                tracing::error!(
+                    "Tried to handle event before setting the desktop context on the event handler"
+                );
+                return None;
+            };
+            Some(desktop_context.upgrade().unwrap())
         };
-
-        let desktop_context = desktop_context.upgrade().unwrap();
-
-        let query = desktop_context.query.clone();
-        let hovered_file = desktop_context.file_hover.clone();
 
         // check for a mounted event placeholder and replace it with a desktop specific element
         let as_any = match data {
             dioxus_html::EventData::Mounted => {
-                let element = DesktopElement::new(element, desktop_context.clone(), query.clone());
+                let Some(desktop_context) = desktop_context() else {
+                    return Default::default();
+                };
+                let query = desktop_context.query.clone();
+                let element = DesktopElement::new(element, desktop_context, query);
                 Rc::new(PlatformEventData::new(Box::new(element)))
             }
             dioxus_html::EventData::Form(form) => {
@@ -183,8 +206,11 @@ impl WebviewEdits {
             }
             // Which also includes drops...
             dioxus_html::EventData::Drag(ref drag) => {
+                let Some(desktop_context) = desktop_context() else {
+                    return Default::default();
+                };
                 // we want to override this with a native file engine, provided by the most recent drag event
-                let full_file_paths = hovered_file.current_paths();
+                let full_file_paths = desktop_context.file_hover.current_paths();
 
                 let xfer_data = drag.data_transfer.clone();
                 let new_file_data = xfer_data
@@ -846,5 +872,172 @@ mod tests {
             serde_json::to_value(response).unwrap(),
             serde_json::json!({ "preventDefault": false, "edits": "AAEC" })
         );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::edits::{Arrival, EditWebsocket, PAGE_HEADER, Page};
+    use dioxus::prelude::*;
+    use dioxus_core::{ElementId, Mutation, Mutations};
+    use dioxus_html::{SerializedResizeData, geometry::PixelsSize};
+    use std::cell::Cell;
+
+    thread_local! {
+        static HEARD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn measured() -> Element {
+        let mut sized = use_signal(|| 0);
+        rsx! {
+            div {
+                onresize: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                "{sized}"
+            }
+        }
+    }
+
+    struct Scene {
+        dom: Rc<RefCell<VirtualDom>>,
+        edits: WebviewEdits,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            HEARD.with(|heard| heard.set(0));
+            dioxus_html::set_event_converter(Box::new(crate::events::SerializedHtmlEventConverter));
+            let dom = Rc::new(RefCell::new(VirtualDom::new(measured)));
+            let edits = WebviewEdits::new(
+                dom.borrow().runtime(),
+                EditWebsocket::start().create_queue(),
+                Rc::downgrade(&dom),
+            );
+            Self { dom, edits }
+        }
+
+        fn draw(&self, page: Page) -> ElementId {
+            assert_eq!(self.edits.wry_queue.page_arrived(page), Arrival::Drawn);
+            let mut mutations = Mutations::default();
+            self.dom
+                .borrow_mut()
+                .rebuild_into_a_new_page(&mut mutations);
+            mutations
+                .edits
+                .iter()
+                .find_map(|mutation| match mutation {
+                    Mutation::NewEventListener { name, id } if name == "resize" => Some(*id),
+                    _ => None,
+                })
+                .expect("The page listens for its size.")
+        }
+
+        fn resize(&self, element: ElementId, page: Option<Page>) -> serde_json::Value {
+            let event = serde_json::json!({
+                "name": "resize",
+                "element": element,
+                "bubbles": false,
+                "data": SerializedResizeData::new(
+                    PixelsSize::new(320.0, 640.0),
+                    PixelsSize::new(320.0, 640.0),
+                ),
+            });
+            let mut request = wry::http::Request::builder()
+                .uri(format!(
+                    "{}__events",
+                    crate::protocol::PageAddress::THIS_PLATFORM.index()
+                ))
+                .header(
+                    "dioxus-data",
+                    base64::Engine::encode(&BASE64_STANDARD, event.to_string()),
+                );
+            if let Some(page) = page {
+                request = request.header(PAGE_HEADER, page.to_string());
+            }
+            let body = self
+                .edits
+                .try_handle_event(request.body(Vec::new()).unwrap())
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+    }
+
+    fn heard() -> usize {
+        HEARD.with(Cell::get)
+    }
+
+    fn answered_with_edits(response: &serde_json::Value) -> bool {
+        response
+            .get("edits")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|edits| !edits.is_empty())
+    }
+
+    #[test]
+    fn an_event_from_the_page_drawn_into_is_handled_and_answered_in_its_frame() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        let response = scene.resize(element, Some(page));
+        assert_eq!(heard(), 1);
+        assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn an_event_from_a_replaced_page_never_reaches_the_new_pages_tree_or_takes_its_edits() {
+        let scene = Scene::new();
+        let first = scene.edits.wry_queue.serve_page();
+        let old_element = scene.draw(first);
+        assert!(answered_with_edits(&scene.resize(old_element, Some(first))));
+        assert_eq!(heard(), 1);
+
+        let second = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(second);
+        let response = scene.resize(element, Some(first));
+        assert_eq!(
+            heard(),
+            1,
+            "The replaced page's event ran a handler in the new page's tree."
+        );
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+
+        let response = scene.resize(element, Some(second));
+        assert_eq!(heard(), 2);
+        assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn an_event_from_a_page_that_has_not_reported_in_is_dropped() {
+        let scene = Scene::new();
+        let first = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(first);
+        let arriving = scene.edits.wry_queue.serve_page();
+        let response = scene.resize(element, Some(arriving));
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+    }
+
+    #[test]
+    fn an_event_from_a_lost_page_is_dropped() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        scene.edits.wry_queue.forget_connection();
+        let response = scene.resize(element, Some(page));
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+    }
+
+    #[test]
+    fn an_event_that_does_not_name_its_page_is_dropped() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        let response = scene.resize(element, None);
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
     }
 }

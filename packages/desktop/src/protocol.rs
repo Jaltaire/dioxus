@@ -250,9 +250,12 @@ fn index_request(
 /// - port: the port that the websocket server is listening on for edits
 /// - webview_id: the id of the webview that we're loading this into. This is used to differentiate between
 ///   multiple webviews in the same application, so that we can send edits to the correct one.
+/// - page: the number this page is served under, which it names itself by in its report that it has loaded,
+///   its edits connection, and every event, so that nothing meant for another page is ever taken as its own.
 fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> String {
     let edits_path = edit_state.wry_queue.edits_path();
     let expected_key = edit_state.wry_queue.required_server_key();
+    let page = edit_state.wry_queue.serve_page();
 
     format!(
         r#"
@@ -264,14 +267,14 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
     {NATIVE_JS}
 
     // The native interpreter extends the sledgehammer interpreter with a few extra methods that we use for IPC
-    window.interpreter = new NativeInterpreter("{BASE_URI}", {headless});
+    window.interpreter = new NativeInterpreter("{BASE_URI}", {headless}, {page});
 
     // Wait for the page to load before sending the initialize message
     window.onload = function() {{
         let root_element = window.document.getElementById("{root_id}");
         if (root_element != null) {{
             window.interpreter.initialize(root_element);
-            window.interpreter.sendIpcMessage("initialize");
+            window.interpreter.sendIpcMessage("initialize", {{ page: {page} }});
         }}
         window.interpreter.waitForRequest("{edits_path}", "{expected_key}");
     }}

@@ -1,8 +1,8 @@
 use crate::{
     config::{Config, WindowCloseBehaviour},
-    edits::EditWebsocket,
+    edits::{Arrival, EditWebsocket},
     event_handlers::WindowEventHandlers,
-    ipc::{IpcMessage, UserWindowEvent},
+    ipc::{IpcMessage, PageReport, UserWindowEvent},
     query::QueryResult,
     shortcut::ShortcutRegistry,
     webview::{PendingWebview, WebviewInstance},
@@ -599,7 +599,11 @@ impl App {
         // The page that died never closed its connection, so what is sent next
         // would go to a channel nothing is reading. Forgetting it first means
         // the edits that rebuild the new page are queued for it instead.
-        view.edits.wry_queue.forget_connection();
+        {
+            #[cfg(target_os = "android")]
+            let _lock = crate::android_sync_lock::android_runtime_lock();
+            view.edits.wry_queue.forget_connection();
+        }
 
         if let Err(error) = view
             .desktop_context
@@ -626,38 +630,61 @@ impl App {
     /// The webview is finally loaded
     ///
     /// Let's rebuild it and then start polling it
-    pub fn handle_initialize_msg(&mut self, id: WindowId) {
-        if let Some(pending) = self.pending_reloads.get(&id).copied() {
-            let since_asked = pending.asked_at.elapsed();
-            if pending.is_an_earlier_attempts_page(since_asked) {
-                tracing::warn!(
-                    "A page reported in {since_asked:?} after the page was asked for again, so it \
-                     is the page being replaced; it is drawn into, and the wait for the one \
-                     asked for goes on."
-                );
-            } else {
-                self.pending_reloads.remove(&id);
-                tracing::info!("The page loaded again and reported in.");
-            }
-        }
+    ///
+    /// The page names itself when it reports in. Only a page newer than every
+    /// page that has reported in before is rebuilt into, so a page is rebuilt
+    /// into once, and a page that has been replaced is never rebuilt into
+    /// again however late its report comes.
+    pub fn handle_initialize_msg(&mut self, id: WindowId, msg: IpcMessage) {
+        let Ok(PageReport { page }) = serde_json::from_value::<PageReport>(msg.params()) else {
+            tracing::warn!(
+                "A page reported in without naming itself, so nothing is drawn into it."
+            );
+            return;
+        };
 
         let view = self.webviews.get_mut(&id).unwrap();
 
-        // The page is back, and from here the guard lets it load exactly once
-        // more only when it is lost again.
-        view.desktop_context
-            .page_awaited
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        view.desktop_context
-            .page_loaded
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            #[cfg(target_os = "android")]
+            let _lock = crate::android_sync_lock::android_runtime_lock();
 
-        view.edits.wry_queue.page_arrived();
-        view.edits
-            .wry_queue
-            .with_mutation_state_mut(|f| view.dom.borrow_mut().rebuild_into_a_new_page(f));
+            if let Arrival::Stale { newest } = view.edits.wry_queue.page_arrived(page) {
+                tracing::info!(
+                    "Page {page} reported in after page {newest} had, so it is not drawn into."
+                );
+                return;
+            }
 
-        view.edits.wry_queue.send_edits();
+            if let Some(pending) = self.pending_reloads.get(&id).copied() {
+                let since_asked = pending.asked_at.elapsed();
+                if pending.is_an_earlier_attempts_page(since_asked) {
+                    tracing::warn!(
+                        "A page reported in {since_asked:?} after the page was asked for again, so it \
+                         is the page being replaced; it is drawn into, and the wait for the one \
+                         asked for goes on."
+                    );
+                } else {
+                    self.pending_reloads.remove(&id);
+                    tracing::info!("The page loaded again and reported in.");
+                }
+            }
+
+            // The page is back, and from here the guard lets it load exactly once
+            // more only when it is lost again.
+            view.desktop_context
+                .page_awaited
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            view.desktop_context
+                .page_loaded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            view.edits
+                .wry_queue
+                .with_mutation_state_mut(|f| view.dom.borrow_mut().rebuild_into_a_new_page(f));
+
+            view.edits.wry_queue.send_edits();
+        }
 
         // Anything the document put into the head belongs to the page that had
         // it, and a page that has replaced another starts with an empty one.
