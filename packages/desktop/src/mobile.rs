@@ -26,23 +26,36 @@ pub extern "C" fn start_app() {
     //
     // `WryActivity.onCreate` (and therefore this setup) runs again on activity re-creation —
     // rotation, theme changes, back/foreground cycles — and the previous activity's reference is
-    // deleted with it. The context is therefore published again for every activity, from a
-    // reference of its own held until the next one replaces it, so consumers are never handed
-    // the deleted one.
+    // deleted with it. The context published is therefore the application's, which outlives every
+    // activity: it is published once, from a reference held for the life of the process, and never
+    // cleared, so no consumer can find it missing or deleted.
     unsafe fn android_setup(
         package: &str,
-        env: ::wry::prelude::JNIEnv<'_>,
+        mut env: ::wry::prelude::JNIEnv<'_>,
         looper: &::ndk::looper::ThreadLooper,
         activity: ::wry::prelude::GlobalRef,
     ) {
-        static ACTIVITY: crate::android_context::CurrentContext<::wry::prelude::GlobalRef> =
-            crate::android_context::CurrentContext::new();
+        static APPLICATION: crate::android_context::ApplicationContext<::wry::prelude::GlobalRef> =
+            crate::android_context::ApplicationContext::new();
         let vm = env.get_java_vm().unwrap();
-        let held = env.new_global_ref(activity.as_obj()).unwrap();
         unsafe {
-            ACTIVITY.publish(vm.get_java_vm_pointer() as *mut _, held, |held| {
-                held.as_obj().as_raw() as *mut _
-            });
+            APPLICATION.publish(
+                vm.get_java_vm_pointer() as *mut _,
+                || {
+                    let application = env
+                        .call_method(
+                            activity.as_obj(),
+                            "getApplicationContext",
+                            "()Landroid/content/Context;",
+                            &[],
+                        )
+                        .unwrap()
+                        .l()
+                        .unwrap();
+                    env.new_global_ref(application).unwrap()
+                },
+                |held| held.as_obj().as_raw() as *mut _,
+            );
         }
         unsafe {
             wry::android_setup(package, env, looper, activity);

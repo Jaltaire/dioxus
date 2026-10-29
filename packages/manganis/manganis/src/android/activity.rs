@@ -18,7 +18,9 @@ static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 /// # Returns
 ///
 /// Returns `Some(R)` if the operation succeeds, `None` if there's an error
-/// getting the VM or Activity references.
+/// getting the VM or Activity references, or if the context `ndk_context`
+/// holds is not an activity, as it is not where the application's own
+/// context is published.
 ///
 /// # Example
 ///
@@ -48,6 +50,12 @@ where
         activity
     } else {
         let raw_activity = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
+        if !env
+            .is_instance_of(&raw_activity, "android/app/Activity")
+            .ok()?
+        {
+            return None;
+        }
         let global = env.new_global_ref(&raw_activity).ok()?;
         match ACTIVITY.set(global) {
             Ok(()) => ACTIVITY.get().unwrap(),

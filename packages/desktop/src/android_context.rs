@@ -1,50 +1,50 @@
 use std::ffi::c_void;
-use std::sync::{Mutex, PoisonError};
+use std::sync::OnceLock;
 
-/// The activity `ndk_context` hands every consumer, kept current across the activity being
-/// created again.
+/// The context `ndk_context` hands every consumer: the application's own, published once and
+/// held for as long as the process lives.
 ///
 /// Android destroys an activity and creates another in the same process whenever it is asked to
-/// show a configuration change the activity does not handle itself. Each creation runs the
-/// application's setup again with a new activity, and the reference to the old one is deleted
-/// with it. A context published once, at the first creation, would then name a deleted global
-/// reference, and the next JNI call through it aborts the process. Each creation therefore
-/// publishes its own activity, held here until the next one replaces it.
-pub(crate) struct CurrentContext<H> {
-    held: Mutex<Option<H>>,
+/// show a configuration change the activity does not handle itself, and the reference to the old
+/// activity is deleted with it. `ndk_context` keeps its context in an unsynchronized static that
+/// can only be cleared and set again, never replaced, so a context published for each activity
+/// leaves a moment in which a consumer on another thread finds none and panics, and a consumer
+/// still holding the previous activity's reference aborts once it is deleted. The application
+/// outlives every activity, so its context is published once, never cleared, and never deleted.
+/// A consumer that needs an activity rather than a context has to find the current one itself.
+pub(crate) struct ApplicationContext<H> {
+    held: OnceLock<H>,
 }
 
-impl<H> CurrentContext<H> {
+impl<H> ApplicationContext<H> {
     /// Nothing published yet.
     pub(crate) const fn new() -> Self {
         Self {
-            held: Mutex::new(None),
+            held: OnceLock::new(),
         }
     }
 
-    /// Publishes the activity `held` refers to, through `object`, as the context every
-    /// `ndk_context` consumer is handed, and keeps `held` alive until the next activity takes its
-    /// place. The activity published before is let go only once `ndk_context` names the new one.
+    /// Publishes the application's context as the one every `ndk_context` consumer is handed, the
+    /// first time it is called, from the reference `application` makes, through `object`, and
+    /// holds that reference for good. Every later call leaves `ndk_context` as it is and makes no
+    /// reference.
     ///
     /// # Safety
     ///
-    /// `java_vm` is the process's `JavaVM`, `object(&held)` is a JNI reference that stays valid
-    /// for as long as `held` lives, and nothing but this publishes an `ndk_context`.
+    /// `java_vm` is the process's `JavaVM`, `object(&held)` is a JNI reference to the application's
+    /// context that stays valid for as long as `held` lives, and nothing but this publishes an
+    /// `ndk_context`.
     pub(crate) unsafe fn publish(
         &self,
         java_vm: *mut c_void,
-        held: H,
+        application: impl FnOnce() -> H,
         object: impl FnOnce(&H) -> *mut c_void,
-    ) {
-        let mut current = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let context = object(&held);
-        unsafe {
-            if current.is_some() {
-                ndk_context::release_android_context();
-            }
-            ndk_context::initialize_android_context(java_vm, context);
-        }
-        *current = Some(held);
+    ) -> &H {
+        self.held.get_or_init(|| {
+            let held = application();
+            unsafe { ndk_context::initialize_android_context(java_vm, object(&held)) };
+            held
+        })
     }
 }
 
@@ -52,14 +52,14 @@ impl<H> CurrentContext<H> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    struct Activity {
+    struct Application {
         object: Box<u8>,
         let_go: Arc<AtomicUsize>,
     }
 
-    impl Activity {
+    impl Application {
         fn new(let_go: &Arc<AtomicUsize>) -> Self {
             Self {
                 object: Box::new(0),
@@ -72,44 +72,73 @@ mod tests {
         }
     }
 
-    impl Drop for Activity {
+    impl Drop for Application {
         fn drop(&mut self) {
             self.let_go.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     #[test]
-    fn every_activity_created_is_the_one_consumers_are_handed_until_the_next() {
-        let current = CurrentContext::new();
+    fn the_application_is_published_once_and_every_consumer_finds_it_for_good() {
+        let context: &'static ApplicationContext<Application> =
+            Box::leak(Box::new(ApplicationContext::new()));
         let java_vm = std::ptr::without_provenance_mut::<c_void>(0x1000);
         let let_go = Arc::new(AtomicUsize::new(0));
+        let made = Arc::new(AtomicUsize::new(0));
 
-        let first = Activity::new(&let_go);
-        let first_object = first.object();
-        unsafe { current.publish(java_vm, first, Activity::object) };
-        assert_eq!(ndk_context::android_context().context(), first_object);
+        let make = |made: &Arc<AtomicUsize>| {
+            made.fetch_add(1, Ordering::SeqCst);
+            Application::new(&let_go)
+        };
+        let published = unsafe { context.publish(java_vm, || make(&made), Application::object) };
+        let object = published.object();
+        assert_eq!(ndk_context::android_context().context(), object);
         assert_eq!(ndk_context::android_context().vm(), java_vm);
-        assert_eq!(let_go.load(Ordering::SeqCst), 0, "The first is still held.");
 
-        let second = Activity::new(&let_go);
-        let second_object = second.object();
-        assert_ne!(first_object, second_object);
-        unsafe { current.publish(java_vm, second, Activity::object) };
+        let reading = Arc::new(AtomicBool::new(true));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let reading = Arc::clone(&reading);
+                let object = object as usize;
+                std::thread::spawn(move || {
+                    let mut reads = 0usize;
+                    while reading.load(Ordering::SeqCst) || reads == 0 {
+                        assert_eq!(ndk_context::android_context().context() as usize, object);
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        for _ in 0..1000 {
+            let again = unsafe { context.publish(java_vm, || make(&made), Application::object) };
+            assert_eq!(
+                again.object(),
+                object,
+                "An activity created again finds the application already published."
+            );
+        }
+        reading.store(false, Ordering::SeqCst);
+        for reader in readers {
+            assert!(
+                reader
+                    .join()
+                    .expect("No consumer ever found the context missing.")
+                    > 0,
+                "Every consumer read the context while activities were created again."
+            );
+        }
+
         assert_eq!(
-            ndk_context::android_context().context(),
-            second_object,
-            "The activity created again is the one handed out, not the deleted one."
+            made.load(Ordering::SeqCst),
+            1,
+            "Only the first creation makes a reference."
         );
         assert_eq!(
             let_go.load(Ordering::SeqCst),
-            1,
-            "The first is let go once the second has taken its place."
+            0,
+            "The application's reference is never let go."
         );
-
-        let third = Activity::new(&let_go);
-        let third_object = third.object();
-        unsafe { current.publish(java_vm, third, Activity::object) };
-        assert_eq!(ndk_context::android_context().context(), third_object);
-        assert_eq!(let_go.load(Ordering::SeqCst), 2);
+        assert_eq!(ndk_context::android_context().context(), object);
     }
 }
