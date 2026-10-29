@@ -70,12 +70,60 @@ pub(crate) struct QueryEngine {
     pub active_requests: SharedRequests<QueryEntry>,
 }
 
+/// Whether a query has a page to run in: one that has reported in, or none,
+/// because the page was lost and its replacement has not reported in yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryPage {
+    Drawn,
+    Awaited,
+}
+
+impl QueryPage {
+    fn of(context: &DesktopContext) -> Self {
+        if context
+            .page_awaited
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            QueryPage::Awaited
+        } else {
+            QueryPage::Drawn
+        }
+    }
+}
+
 impl QueryEngine {
     /// Creates a new query and returns a handle to it. The query will be resolved when the webview returns a result with the same id.
+    ///
+    /// A query asked for while the page is lost and its replacement has not
+    /// reported in is never sent. Its script was written for the page that is
+    /// gone, and the page loading in its place has none of the scripts a
+    /// query runs on yet, so it would only throw there. The query waits, as
+    /// one that threw would have, and goes with the task that asked for it
+    /// when the tree is rebuilt into the new page.
     pub fn new_query<V: DeserializeOwned>(
         &self,
         script: &str,
         context: DesktopContext,
+    ) -> Query<V> {
+        self.start(
+            script,
+            QueryPage::of(&context),
+            Rc::downgrade(&context),
+            |script| {
+                context
+                    .webview
+                    .evaluate_script(script)
+                    .map_err(|err| err.to_string())
+            },
+        )
+    }
+
+    fn start<V: DeserializeOwned>(
+        &self,
+        script: &str,
+        page: QueryPage,
+        desktop: WeakDesktopContext,
+        evaluate: impl FnOnce(&str) -> Result<(), String>,
     ) -> Query<V> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         let (return_tx, return_rx) = futures_channel::oneshot::channel();
@@ -91,7 +139,7 @@ impl QueryEngine {
 
         // start the query
         // We embed the return of the eval in a function so we can send it back to the main thread
-        if let Err(err) = context.webview.evaluate_script(&format!(
+        let script = format!(
             r#"(function(){{
                 let dioxus = window.createQuery({request_id});
                 let post_error = function(err) {{
@@ -135,15 +183,23 @@ impl QueryEngine {
                     post_error(`Invalid JS: ${{error}}`);
                 }}
             }})();"#
-        )) {
-            tracing::warn!("Query error: {err}");
+        );
+        match page {
+            QueryPage::Drawn => {
+                if let Err(err) = evaluate(&script) {
+                    tracing::warn!("Query error: {err}");
+                }
+            }
+            QueryPage::Awaited => tracing::debug!(
+                "Query {request_id} was asked for while the page is awaited, and is not sent to it."
+            ),
         }
 
         Query {
             id: request_id,
             receiver: rx,
             return_receiver: Some(return_rx),
-            desktop: Rc::downgrade(&context),
+            desktop,
             phantom: std::marker::PhantomData,
         }
     }
@@ -192,16 +248,35 @@ impl<V: DeserializeOwned> Query<V> {
 
     /// Send a message to the query
     pub fn send<S: ToString>(&self, message: S) -> Result<(), QueryError> {
+        let desktop = self.desktop.upgrade().ok_or(QueryError::Finished)?;
+        self.send_to(QueryPage::of(&desktop), message, |script| {
+            desktop
+                .webview
+                .evaluate_script(script)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Sends a message to the query in the page it runs in. While the page
+    /// is awaited there is no such page: the one the query ran in is gone,
+    /// and the one loading has never heard of it.
+    fn send_to<S: ToString>(
+        &self,
+        page: QueryPage,
+        message: S,
+        evaluate: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(), QueryError> {
+        if page == QueryPage::Awaited {
+            return Err(QueryError::Send(String::from(
+                "The page the query ran in has been lost, and the page replacing it has not reported in.",
+            )));
+        }
         let queue_id = self.id;
 
         let data = message.to_string();
         let script = format!(r#"window.getQuery({queue_id}).rustSend({data});"#);
 
-        let desktop = self.desktop.upgrade().ok_or(QueryError::Finished)?;
-        desktop
-            .webview
-            .evaluate_script(&script)
-            .map_err(|e| QueryError::Send(e.to_string()))?;
+        evaluate(&script).map_err(QueryError::Send)?;
 
         Ok(())
     }
@@ -274,6 +349,109 @@ enum QueryResultData {
     Send { data: Value },
     #[serde(rename = "drop")]
     Drop,
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn started(page: QueryPage, evaluated: &RefCell<Vec<String>>) -> (QueryEngine, Query<Value>) {
+        let engine = QueryEngine::default();
+        let query = engine.start::<Value>("return 1;", page, std::rc::Weak::new(), |script| {
+            evaluated.borrow_mut().push(script.to_owned());
+            Ok(())
+        });
+        (engine, query)
+    }
+
+    #[test]
+    fn a_query_asked_for_while_a_page_is_drawn_into_is_sent_to_it() {
+        let evaluated = RefCell::new(Vec::new());
+        let (engine, mut query) = started(QueryPage::Drawn, &evaluated);
+        let evaluated = evaluated.into_inner();
+        assert_eq!(evaluated.len(), 1);
+        assert!(evaluated[0].contains(&format!("window.createQuery({})", query.id)));
+        assert!(
+            engine
+                .active_requests
+                .requests
+                .borrow_mut()
+                .get_mut(query.id)
+                .is_some()
+        );
+        assert!(
+            query.result().now_or_never().is_none(),
+            "The query waits for the page."
+        );
+    }
+
+    #[test]
+    fn a_query_asked_for_while_the_page_is_awaited_is_never_sent_and_waits() {
+        let evaluated = RefCell::new(Vec::new());
+        let (engine, mut query) = started(QueryPage::Awaited, &evaluated);
+        assert!(evaluated.into_inner().is_empty());
+        assert!(
+            engine
+                .active_requests
+                .requests
+                .borrow_mut()
+                .get_mut(query.id)
+                .is_some(),
+            "The query is kept for its evaluator, as one sent would be."
+        );
+        assert!(query.result().now_or_never().is_none());
+    }
+
+    #[test]
+    fn a_message_for_a_query_is_sent_to_the_page_drawn_into() {
+        let evaluated = RefCell::new(Vec::new());
+        let (_engine, query) = started(QueryPage::Drawn, &evaluated);
+        let sent = Cell::new(None);
+        assert!(
+            query
+                .send_to(QueryPage::Drawn, "7", |script| {
+                    sent.set(Some(script.to_owned()));
+                    Ok(())
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            sent.into_inner(),
+            Some(format!("window.getQuery({}).rustSend(7);", query.id))
+        );
+    }
+
+    #[test]
+    fn a_message_for_a_query_while_the_page_is_awaited_is_refused_and_never_sent() {
+        let evaluated = RefCell::new(Vec::new());
+        let (_engine, query) = started(QueryPage::Drawn, &evaluated);
+        let sent = Cell::new(false);
+        let refused = query.send_to(QueryPage::Awaited, "7", |_| {
+            sent.set(true);
+            Ok(())
+        });
+        assert!(matches!(refused, Err(QueryError::Send(_))));
+        assert!(!sent.get());
+    }
+
+    #[test]
+    fn a_message_the_page_cannot_take_is_reported() {
+        let evaluated = RefCell::new(Vec::new());
+        let (_engine, query) = started(QueryPage::Drawn, &evaluated);
+        let failed = query.send_to(QueryPage::Drawn, "7", |_| Err(String::from("gone")));
+        assert!(matches!(failed, Err(QueryError::Send(reason)) if reason == "gone"));
+    }
+
+    #[test]
+    fn a_query_whose_script_cannot_be_evaluated_still_waits() {
+        let engine = QueryEngine::default();
+        let mut query =
+            engine.start::<Value>("return 1;", QueryPage::Drawn, std::rc::Weak::new(), |_| {
+                Err(String::from("gone"))
+            });
+        assert!(query.result().now_or_never().is_none());
+    }
 }
 
 #[cfg(test)]
