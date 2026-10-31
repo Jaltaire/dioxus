@@ -9,17 +9,52 @@ use dioxus_interpreter_js::unified_bindings::SLEDGEHAMMER_JS;
 use dioxus_vdom::AnyhowContext;
 use wry::{
     RequestAsyncResponder,
-    http::{Request, Response, status::StatusCode},
+    http::{Request, Response, header::CACHE_CONTROL, status::StatusCode},
 };
 
-#[cfg(target_os = "android")]
-const BASE_URI: &str = "https://dioxus.index.html/";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageAddress {
+    CustomScheme,
+    Http,
+    Https,
+}
 
-#[cfg(target_os = "windows")]
-const BASE_URI: &str = "http://dioxus.index.html/";
+impl PageAddress {
+    #[cfg(target_os = "android")]
+    pub(crate) const THIS_PLATFORM: Self = Self::Https;
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
-const BASE_URI: &str = "dioxus://index.html/";
+    #[cfg(target_os = "windows")]
+    pub(crate) const THIS_PLATFORM: Self = Self::Http;
+
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    pub(crate) const THIS_PLATFORM: Self = Self::CustomScheme;
+
+    pub(crate) const ALL: [Self; 3] = [Self::CustomScheme, Self::Http, Self::Https];
+
+    pub(crate) const fn index(self) -> &'static str {
+        match self {
+            Self::CustomScheme => "dioxus://index.html/",
+            Self::Http => "http://dioxus.index.html/",
+            Self::Https => "https://dioxus.index.html/",
+        }
+    }
+
+    const fn origin(self) -> &'static str {
+        match self {
+            Self::CustomScheme => "dioxus://",
+            Self::Http => "http://dioxus.",
+            Self::Https => "https://dioxus.",
+        }
+    }
+
+    pub(crate) fn serves(url: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|address| url.starts_with(address.origin()))
+    }
+}
+
+const BASE_URI: &str = PageAddress::THIS_PLATFORM.index();
 
 #[cfg(debug_assertions)]
 static DEFAULT_INDEX: &str = include_str!("./assets/dev.index.html");
@@ -132,6 +167,7 @@ fn index_request(
 
     Response::builder()
         .header("Content-Type", "text/html")
+        .header(CACHE_CONTROL, "no-store")
         .header("Access-Control-Allow-Origin", "*")
         .body(index.into())
         .ok()
@@ -146,9 +182,12 @@ fn index_request(
 /// - port: the port that the websocket server is listening on for edits
 /// - webview_id: the id of the webview that we're loading this into. This is used to differentiate between
 ///   multiple webviews in the same application, so that we can send edits to the correct one.
+/// - page: the number this page is served under, which it names itself by in its report that it has loaded,
+///   its edits connection, and every event, so that nothing meant for another page is ever taken as its own.
 fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> String {
     let edits_path = edit_state.wry_queue.edits_path();
     let expected_key = edit_state.wry_queue.required_server_key();
+    let page = edit_state.wry_queue.serve_page();
 
     format!(
         r#"
@@ -160,14 +199,14 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
     {NATIVE_JS}
 
     // The native interpreter extends the sledgehammer interpreter with a few extra methods that we use for IPC
-    window.interpreter = new NativeInterpreter("{BASE_URI}", {headless});
+    window.interpreter = new NativeInterpreter("{BASE_URI}", {headless}, {page});
 
     // Wait for the page to load before sending the initialize message
     window.onload = function() {{
         let root_element = window.document.getElementById("{root_id}");
         if (root_element != null) {{
             window.interpreter.initialize(root_element);
-            window.interpreter.sendIpcMessage("initialize");
+            window.interpreter.sendIpcMessage("initialize", {{ page: {page} }});
         }}
         window.interpreter.waitForRequest("{edits_path}", "{expected_key}");
     }}
@@ -182,7 +221,7 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 
 fn file_dialog_responder_sync(
     request: wry::http::Request<Vec<u8>>,
-    responder: wry::RequestAsyncResponder,
+    responder: RequestAsyncResponder,
 ) -> dioxus_vdom::Result<()> {
     // Handle the file dialog request
     // We can't use the body, just the headers
@@ -215,7 +254,7 @@ fn file_dialog_responder_sync(
 fn respond_to_file_dialog(
     mut file_dialog: FileDialogRequest,
     file_list: Vec<PathBuf>,
-    responder: wry::RequestAsyncResponder,
+    responder: RequestAsyncResponder,
 ) -> dioxus_vdom::Result<()> {
     // Get the position of the entry we're updating, so we can insert new entries in the same place
     // If we can't find it, just append to the end. This is usually due to the input not being in a form element.
@@ -272,4 +311,70 @@ fn respond_to_file_dialog(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod page_address_tests {
+    use super::PageAddress;
+
+    #[test]
+    fn every_address_of_the_page_is_one_the_navigation_guard_serves() {
+        for address in PageAddress::ALL {
+            assert!(
+                PageAddress::serves(address.index()),
+                "The guard refuses {address:?}'s {}.",
+                address.index()
+            );
+        }
+    }
+
+    #[test]
+    fn every_address_of_the_page_is_under_its_own_origin() {
+        for address in PageAddress::ALL {
+            assert!(address.index().starts_with(address.origin()));
+            for other in PageAddress::ALL
+                .into_iter()
+                .filter(|other| *other != address)
+            {
+                assert!(!address.index().starts_with(other.origin()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_navigation_guard_serves_nothing_but_the_page() {
+        for url in [
+            "https://example.com/",
+            "http://example.com/dioxus.index.html/",
+            "mailto:someone@example.com",
+            "about:blank",
+            "file:///index.html",
+        ] {
+            assert!(!PageAddress::serves(url), "The guard serves {url}.");
+        }
+    }
+
+    #[test]
+    fn the_http_addresses_are_the_custom_scheme_rewritten_as_wry_rewrites_it() {
+        let custom = PageAddress::CustomScheme.index();
+        assert_eq!(
+            PageAddress::Http.index(),
+            custom.replace("dioxus://", "http://dioxus.")
+        );
+        assert_eq!(
+            PageAddress::Https.index(),
+            custom.replace("dioxus://", "https://dioxus.")
+        );
+    }
+
+    #[test]
+    fn each_platform_asks_for_the_page_at_the_address_its_web_view_serves_it_from() {
+        #[cfg(target_os = "android")]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::Https);
+        #[cfg(target_os = "windows")]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::Http);
+        #[cfg(not(any(target_os = "android", target_os = "windows")))]
+        assert_eq!(PageAddress::THIS_PLATFORM, PageAddress::CustomScheme);
+        assert_eq!(super::BASE_URI, PageAddress::THIS_PLATFORM.index());
+    }
 }

@@ -1,4 +1,4 @@
-use crate::{DesktopContext, WeakDesktopContext, query::Query};
+use crate::{DesktopContext, WeakDesktopContext, head_record::HeadInsertion, query::Query};
 use dioxus_document::{
     Document, Eval, EvalError, Evaluator, LinkProps, MetaProps, ScriptProps, StyleProps,
     create_element_in_head,
@@ -23,6 +23,21 @@ impl DesktopDocument {
     }
 }
 
+impl DesktopDocument {
+    fn put_in_head(&self, js: String) {
+        let insertion = match self.desktop_ctx.upgrade() {
+            Some(ctx) => ctx.remember_head_element(js.clone()),
+            None => HeadInsertion::PutIn,
+        };
+        match insertion {
+            HeadInsertion::PutIn => {
+                self.eval(js);
+            }
+            HeadInsertion::AlreadyInPage => {}
+        }
+    }
+}
+
 impl Document for DesktopDocument {
     fn eval(&self, js: String) -> Eval {
         Eval::new(DesktopEvaluator::create(
@@ -43,7 +58,8 @@ impl Document for DesktopDocument {
     fn create_meta(&self, props: MetaProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("meta", &props.attributes(), None));
+            let js = create_element_in_head("meta", &props.attributes(), None);
+            myself.put_in_head(js);
         });
     }
 
@@ -51,11 +67,9 @@ impl Document for DesktopDocument {
     fn create_script(&self, props: ScriptProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
-                "script",
-                &props.attributes(),
-                props.script_contents().ok(),
-            ));
+            let js =
+                create_element_in_head("script", &props.attributes(), props.script_contents().ok());
+            myself.put_in_head(js);
         });
     }
 
@@ -63,11 +77,9 @@ impl Document for DesktopDocument {
     fn create_style(&self, props: StyleProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head(
-                "style",
-                &props.attributes(),
-                props.style_contents().ok(),
-            ));
+            let js =
+                create_element_in_head("style", &props.attributes(), props.style_contents().ok());
+            myself.put_in_head(js);
         });
     }
 
@@ -75,7 +87,8 @@ impl Document for DesktopDocument {
     fn create_link(&self, props: LinkProps) {
         let myself = self.clone();
         queue_effect(move || {
-            myself.eval(create_element_in_head("link", &props.attributes(), None));
+            let js = create_element_in_head("link", &props.attributes(), None);
+            myself.put_in_head(js);
         });
     }
 }

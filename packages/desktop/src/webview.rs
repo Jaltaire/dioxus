@@ -5,16 +5,18 @@ use crate::file_upload::{DesktopFileData, DesktopFileDragEvent};
 use crate::menubar::DioxusMenu;
 use crate::{
     DesktopContext, DesktopService, WindowConfig, assets::AssetHandlerRegistry, edits::WryQueue,
-    file_upload::NativeFileHover, ipc::UserWindowEvent, protocol,
+    file_upload::NativeFileHover, ipc::UserWindowEvent, protocol, protocol::PageAddress,
 };
 use crate::{element::DesktopElement, file_upload::DesktopFormData};
 use base64::prelude::BASE64_STANDARD;
 use dioxus_hooks::to_owned;
 use dioxus_html::{FileData, FormValue, HtmlEvent, PlatformEventData, SerializedFileData};
 use dioxus_vdom::{RenderTargetId, Runtime, VirtualDom};
-use std::rc::Rc;
+use std::cell::{OnceCell, RefCell};
+use std::collections::BTreeMap;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, atomic::AtomicBool};
-use std::{cell::OnceCell, time::Duration};
+use std::time::Duration;
 use wry::{DragDropEvent, RequestAsyncResponder, WebContext, WebViewBuilder, WebViewId};
 
 fn restore_window_state(
@@ -54,21 +56,77 @@ fn restore_window_state(
 }
 
 #[derive(Clone)]
+pub(crate) struct SharedDom {
+    pub(crate) dom: Rc<RefCell<VirtualDom>>,
+    pub(crate) queues: Rc<RefCell<BTreeMap<RenderTargetId, WryQueue>>>,
+}
+
+#[derive(Clone)]
 pub(crate) struct WebviewEdits {
     runtime: Rc<Runtime>,
     target_id: RenderTargetId,
     pub wry_queue: WryQueue,
     desktop_context: Rc<OnceCell<WeakDesktopContext>>,
+    dom: Weak<RefCell<VirtualDom>>,
+    queues: Weak<RefCell<BTreeMap<RenderTargetId, WryQueue>>>,
+}
+
+const ANSWERED_IN_THEIR_FRAME: &[&str] = &["resize"];
+
+pub(crate) fn answered_in_its_frame(name: &str) -> bool {
+    ANSWERED_IN_THEIR_FRAME.contains(&name)
 }
 
 impl WebviewEdits {
-    fn new(runtime: Rc<Runtime>, target_id: RenderTargetId, wry_queue: WryQueue) -> Self {
+    pub(crate) fn new(
+        runtime: Rc<Runtime>,
+        target_id: RenderTargetId,
+        wry_queue: WryQueue,
+        shared: &SharedDom,
+    ) -> Self {
         Self {
             runtime,
             target_id,
             wry_queue,
             desktop_context: Default::default(),
+            dom: Rc::downgrade(&shared.dom),
+            queues: Rc::downgrade(&shared.queues),
         }
+    }
+
+    fn render_in_frame(&self) -> Option<String> {
+        let dom = self.dom.upgrade()?;
+        let queues = self.queues.upgrade()?;
+        if !self.wry_queue.is_idle() {
+            return None;
+        }
+        let mut writer: BTreeMap<RenderTargetId, WryQueue> = queues
+            .try_borrow()
+            .ok()?
+            .iter()
+            .map(|(target_id, queue)| (*target_id, queue.clone()))
+            .collect();
+        if writer
+            .iter()
+            .any(|(target_id, queue)| *target_id != self.target_id && queue.has_edits_in_flight())
+        {
+            return None;
+        }
+        let mut dom = dom.try_borrow_mut().ok()?;
+        for queue in writer.values() {
+            queue.clear_touched();
+        }
+        dom.render_immediate(&mut writer);
+        for (target_id, queue) in &writer {
+            if *target_id != self.target_id && queue.is_touched() {
+                queue.send_edits();
+            }
+        }
+        self.wry_queue.clear_touched();
+        Some(base64::Engine::encode(
+            &BASE64_STANDARD,
+            self.wry_queue.take_rendered(),
+        ))
     }
 
     pub fn handle_event(
@@ -106,12 +164,33 @@ impl WebviewEdits {
         let data_from_header = base64::Engine::decode(&BASE64_STANDARD, as_utf)
             .map_err(|_| Error::custom("dioxus-data header is not a base64 string"))?;
 
+        let page = request
+            .headers()
+            .get(crate::edits::PAGE_HEADER)
+            .and_then(|page| page.to_str().ok())
+            .and_then(|page| page.parse::<crate::edits::Page>().ok());
+
         let response = match serde_json::from_slice(&data_from_header) {
             Ok(event) => {
                 // we need to wait for the mutex lock to let us munge the main thread..
                 #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
-                self.handle_html_event(event)
+                match page {
+                    Some(page) if self.wry_queue.is_drawn(page) => self.handle_html_event(event),
+                    Some(page) => {
+                        tracing::info!(
+                            "An event from page {page}, which is not the page being drawn into, \
+                             is dropped."
+                        );
+                        SynchronousEventResponse::new(false)
+                    }
+                    None => {
+                        tracing::warn!(
+                            "An event that does not name the page it came from is dropped."
+                        );
+                        SynchronousEventResponse::new(false)
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(
@@ -136,22 +215,24 @@ impl WebviewEdits {
             bubbles,
             data,
         } = event;
-        let Some(desktop_context) = self.desktop_context.get() else {
-            tracing::error!(
-                "Tried to handle event before setting the desktop context on the event handler"
-            );
-            return Default::default();
+        let desktop_context = || {
+            let Some(desktop_context) = self.desktop_context.get() else {
+                tracing::error!(
+                    "Tried to handle event before setting the desktop context on the event handler"
+                );
+                return None;
+            };
+            Some(desktop_context.upgrade().unwrap())
         };
-
-        let desktop_context = desktop_context.upgrade().unwrap();
-
-        let query = desktop_context.query.clone();
-        let hovered_file = desktop_context.file_hover.clone();
 
         // check for a mounted event placeholder and replace it with a desktop specific element
         let as_any = match data {
             dioxus_html::EventData::Mounted => {
-                let element = DesktopElement::new(element, desktop_context.clone(), query.clone());
+                let Some(desktop_context) = desktop_context() else {
+                    return Default::default();
+                };
+                let query = desktop_context.query.clone();
+                let element = DesktopElement::new(element, desktop_context, query);
                 Rc::new(PlatformEventData::new(Box::new(element)))
             }
             dioxus_html::EventData::Form(form) => {
@@ -186,8 +267,11 @@ impl WebviewEdits {
             }
             // Which also includes drops...
             dioxus_html::EventData::Drag(ref drag) => {
+                let Some(desktop_context) = desktop_context() else {
+                    return Default::default();
+                };
                 // we want to override this with a native file engine, provided by the most recent drag event
-                let full_file_paths = hovered_file.current_paths();
+                let full_file_paths = desktop_context.file_hover.current_paths();
 
                 let xfer_data = drag.data_transfer.clone();
                 let new_file_data = xfer_data
@@ -223,7 +307,12 @@ impl WebviewEdits {
             .handle_event_for_target(self.target_id, &name, event.clone(), element);
 
         // Get the response from the event
-        SynchronousEventResponse::new(!event.default_action_enabled())
+        SynchronousEventResponse {
+            prevent_default: !event.default_action_enabled(),
+            edits: answered_in_its_frame(&name)
+                .then(|| self.render_in_frame())
+                .flatten(),
+        }
     }
 }
 
@@ -318,7 +407,7 @@ impl WebviewInstance {
     pub(crate) fn new(
         mut cfg: WindowConfig,
         target_id: RenderTargetId,
-        dom: &mut VirtualDom,
+        shared: &SharedDom,
         app_context: Rc<DesktopAppContext>,
     ) -> WebviewInstance {
         let mut window = cfg.window.clone();
@@ -344,7 +433,7 @@ impl WebviewInstance {
         let window = Arc::new(window.build(&app_context.target).unwrap());
         restore_window_state(&window, explicit_window_size, explicit_window_position);
         if let Some(on_build) = cfg.on_window.as_mut() {
-            on_build(window.clone(), dom);
+            on_build(window.clone(), &mut shared.dom.borrow_mut());
         }
 
         // https://developer.apple.com/documentation/appkit/nswindowcollectionbehavior/nswindowcollectionbehaviormanaged
@@ -373,9 +462,20 @@ impl WebviewInstance {
         }));
         let edit_queue = app_context.websocket.create_queue();
         let asset_handlers = AssetHandlerRegistry::new();
-        let edits = WebviewEdits::new(dom.runtime(), target_id, edit_queue.clone());
+        let edits = WebviewEdits::new(
+            shared.dom.borrow().runtime(),
+            target_id,
+            edit_queue.clone(),
+            shared,
+        );
         let file_hover = NativeFileHover::default();
         let headless = !cfg.window.window.visible;
+
+        // Set when the page's own document is asked for, which the platform
+        // does only once the process that will draw it is up and loading: the
+        // one sign that a load of the page is truly under way, as opposed to
+        // asked for. Cleared when the page is lost.
+        let page_begun = Arc::new(AtomicBool::new(false));
 
         let request_handler = {
             to_owned![
@@ -385,11 +485,17 @@ impl WebviewInstance {
                 asset_handlers,
                 edits
             ];
+            let page_begun = page_begun.clone();
 
             #[cfg(feature = "tokio_runtime")]
             let tokio_rt = tokio::runtime::Handle::current();
 
-            let handler = move |request, responder: RequestAsyncResponder| {
+            let handler = move |request: wry::http::Request<Vec<u8>>,
+                                responder: RequestAsyncResponder| {
+                if request.uri().path() == "/" {
+                    page_begun.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
                 protocol::desktop_handler(
                     request,
                     asset_handlers.clone(),
@@ -469,6 +575,15 @@ impl WebviewInstance {
         // the page this guards is already gone.
         let page_loaded = Arc::new(AtomicBool::new(false));
 
+        // Set from the moment the page is lost until its replacement reports
+        // in. While it is set, every navigation to the page is allowed: the
+        // platform reloads the page on its own after taking its process, the
+        // application asks for it too, and a load refused in that window
+        // leaves the frame holding a document with none of the page's
+        // scripts in it -- one that can never report in, however many times
+        // it is asked for.
+        let page_awaited = Arc::new(AtomicBool::new(false));
+
         let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_bounds(wry::Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
@@ -478,33 +593,33 @@ impl WebviewInstance {
                 )),
             })
             .with_transparent(cfg.window.window.transparent)
-            .with_url("dioxus://index.html/")
+            .with_url(PageAddress::CustomScheme.index())
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler({
                 let page_loaded = page_loaded.clone();
+                let page_awaited = page_awaited.clone();
                 move |var: String| {
-                // Serve the index and assets.
-                if var.starts_with("dioxus://")
-                    || var.starts_with("http://dioxus.")
-                    || var.starts_with("https://dioxus.")
-                {
-                    // After the page has loaded once, don't allow any more navigation
-                    let page_loaded = page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
-                    return !page_loaded;
-                }
+                    // Serve the index and assets.
+                    if PageAddress::serves(&var) {
+                        // After the page has loaded once, don't allow any more navigation
+                        let page_loaded =
+                            page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
+                        return !page_loaded
+                            || page_awaited.load(std::sync::atomic::Ordering::SeqCst);
+                    }
 
-                // External links always open somewhere else. Prevents the webview from navigating
-                if var.starts_with("http://")
-                    || var.starts_with("https://")
-                    || var.starts_with("mailto:")
-                {
-                    _ = webbrowser::open(&var);
-                    return false;
-                }
+                    // External links always open somewhere else. Prevents the webview from navigating
+                    if var.starts_with("http://")
+                        || var.starts_with("https://")
+                        || var.starts_with("mailto:")
+                    {
+                        _ = webbrowser::open(&var);
+                        return false;
+                    }
 
-                // By default, external links are allowed. This keeps things like iframes working.
-                // However, users can customize this to allow/disallow domains/routes/patterns.
-                navigation_handler.as_ref().map(|f| f(&var)).unwrap_or(true)
+                    // By default, external links are allowed. This keeps things like iframes working.
+                    // However, users can customize this to allow/disallow domains/routes/patterns.
+                    navigation_handler.as_ref().map(|f| f(&var)).unwrap_or(true)
                 }
             })
             .with_asynchronous_custom_protocol(String::from("dioxus"), request_handler);
@@ -525,12 +640,18 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtDarwin;
 
             let page_loaded = page_loaded.clone();
+            let page_awaited = page_awaited.clone();
+            let (proxy, window_id) = (app_context.proxy.to_owned(), window.id());
             webview = webview.with_on_web_content_process_terminate_handler(move || {
                 tracing::warn!(
-                    "The web content process was terminated. The page will be allowed to load \
-                     again so the application can come back."
+                    "The web content process was terminated. The page will be loaded again so \
+                     the application can come back."
                 );
+                // Cleared before the reload is asked for, because the guard
+                // would refuse the very navigation being asked for.
+                page_awaited.store(true, std::sync::atomic::Ordering::SeqCst);
                 page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+                _ = proxy.send_event(UserWindowEvent::PageLost(window_id));
             });
         };
 
@@ -540,6 +661,29 @@ impl WebviewInstance {
             use wry::WebViewBuilderExtAndroid as _;
 
             webview = webview.with_https_scheme(true);
+
+            let page_loaded = page_loaded.clone();
+            let page_awaited = page_awaited.clone();
+            let (proxy, window_id) = (app_context.proxy.to_owned(), window.id());
+            webview = webview.with_on_page_lost_handler(move |lost| {
+                match lost {
+                    wry::PageLost::RenderProcessCrashed => tracing::warn!(
+                        "The web view's renderer process crashed. The page will be loaded again so \
+                         the application can come back."
+                    ),
+                    wry::PageLost::RenderProcessKilled => tracing::warn!(
+                        "The web view's renderer process was ended by the system. The page will be \
+                         loaded again so the application can come back."
+                    ),
+                    wry::PageLost::ActivityRecreated => tracing::info!(
+                        "The activity was created again, and its web view with it. The page will \
+                         be loaded again so the application can come back."
+                    ),
+                }
+                page_awaited.store(true, std::sync::atomic::Ordering::SeqCst);
+                page_loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+                _ = proxy.send_event(UserWindowEvent::PageLost(window_id));
+            });
         };
 
         // Disable the webview default shortcuts to disable the reload shortcut
@@ -659,6 +803,9 @@ impl WebviewInstance {
             asset_handlers,
             file_hover,
             cfg.window_close_behavior,
+            page_loaded,
+            page_awaited,
+            page_begun,
         ));
 
         // Provide the desktop context to the edit handler.
@@ -716,13 +863,18 @@ impl WebviewInstance {
 pub struct SynchronousEventResponse {
     #[serde(rename = "preventDefault")]
     prevent_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edits: Option<String>,
 }
 
 impl SynchronousEventResponse {
     /// Create a new SynchronousEventResponse
     #[allow(unused)]
     pub fn new(prevent_default: bool) -> Self {
-        Self { prevent_default }
+        Self {
+            prevent_default,
+            edits: None,
+        }
     }
 }
 
@@ -755,10 +907,14 @@ impl PendingWebview {
 
     pub(crate) fn create_window(
         self,
-        dom: &mut VirtualDom,
+        shared: &SharedDom,
         app_context: &Rc<DesktopAppContext>,
     ) -> WebviewInstance {
-        let window = WebviewInstance::new(self.cfg, self.target_id, dom, app_context.clone());
+        let window = WebviewInstance::new(self.cfg, self.target_id, shared, app_context.clone());
+        shared
+            .queues
+            .borrow_mut()
+            .insert(self.target_id, window.edits.wry_queue.clone());
 
         _ = self.sender.send(window.desktop_context.clone());
 
@@ -801,5 +957,226 @@ mod tests {
                     .is_err()
             );
         });
+    }
+
+    #[test]
+    fn a_resize_is_answered_in_its_frame() {
+        assert!(answered_in_its_frame("resize"));
+    }
+
+    #[test]
+    fn every_other_event_is_answered_the_usual_way() {
+        for name in [
+            "click",
+            "scroll",
+            "touchstart",
+            "touchmove",
+            "input",
+            "mounted",
+            "visible",
+            "resized",
+            "Resize",
+            "",
+        ] {
+            assert!(!answered_in_its_frame(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_response_without_edits_says_nothing_of_them() {
+        let response = serde_json::to_value(SynchronousEventResponse::new(true)).unwrap();
+        assert_eq!(response, serde_json::json!({ "preventDefault": true }));
+    }
+
+    #[test]
+    fn a_response_with_edits_carries_them_beside_the_default_action() {
+        let response = SynchronousEventResponse {
+            prevent_default: false,
+            edits: Some("AAEC".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({ "preventDefault": false, "edits": "AAEC" })
+        );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::edits::{Arrival, EditWebsocket, PAGE_HEADER, Page};
+    use dioxus::prelude::*;
+    use dioxus_html::{SerializedResizeData, geometry::PixelsSize};
+    use dioxus_vdom::{ElementId, Mutation, Mutations};
+    use std::cell::Cell;
+
+    thread_local! {
+        static HEARD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn measured() -> Element {
+        let mut sized = use_signal(|| 0);
+        rsx! {
+            div {
+                onresize: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                "{sized}"
+            }
+        }
+    }
+
+    struct Scene {
+        shared: SharedDom,
+        edits: WebviewEdits,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            HEARD.with(|heard| heard.set(0));
+            dioxus_html::set_event_converter(Box::new(crate::events::SerializedHtmlEventConverter));
+            let shared = SharedDom {
+                dom: Rc::new(RefCell::new(VirtualDom::new(measured))),
+                queues: Default::default(),
+            };
+            let queue = EditWebsocket::start().create_queue();
+            shared
+                .queues
+                .borrow_mut()
+                .insert(RenderTargetId::ROOT, queue.clone());
+            let edits = WebviewEdits::new(
+                shared.dom.borrow().runtime(),
+                RenderTargetId::ROOT,
+                queue,
+                &shared,
+            );
+            Self { shared, edits }
+        }
+
+        fn draw(&self, page: Page) -> ElementId {
+            assert_eq!(self.edits.wry_queue.page_arrived(page), Arrival::Drawn);
+            let mut mutations = Mutations::default();
+            self.shared
+                .dom
+                .borrow_mut()
+                .rebuild_into_a_new_page(&mut mutations);
+            let mut top = None;
+            for mutation in &mutations.edits {
+                match mutation {
+                    Mutation::SetId { id } | Mutation::PushId { id } => top = Some(*id),
+                    Mutation::NewEventListener { name } if name == "resize" => {
+                        return top.expect("The element listening for its size has an id.");
+                    }
+                    _ => {}
+                }
+            }
+            panic!("The page listens for its size.")
+        }
+
+        fn resize(&self, element: ElementId, page: Option<Page>) -> serde_json::Value {
+            let event = serde_json::json!({
+                "name": "resize",
+                "element": element,
+                "bubbles": false,
+                "data": SerializedResizeData::new(
+                    PixelsSize::new(320.0, 640.0),
+                    PixelsSize::new(320.0, 640.0),
+                ),
+            });
+            let mut request = wry::http::Request::builder()
+                .uri(format!(
+                    "{}__events",
+                    crate::protocol::PageAddress::THIS_PLATFORM.index()
+                ))
+                .header(
+                    "dioxus-data",
+                    base64::Engine::encode(&BASE64_STANDARD, event.to_string()),
+                );
+            if let Some(page) = page {
+                request = request.header(PAGE_HEADER, page.to_string());
+            }
+            let body = self
+                .edits
+                .try_handle_event(request.body(Vec::new()).unwrap())
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+    }
+
+    fn heard() -> usize {
+        HEARD.with(Cell::get)
+    }
+
+    fn answered_with_edits(response: &serde_json::Value) -> bool {
+        response
+            .get("edits")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|edits| !edits.is_empty())
+    }
+
+    #[test]
+    fn an_event_from_the_page_drawn_into_is_handled_and_answered_in_its_frame() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        let response = scene.resize(element, Some(page));
+        assert_eq!(heard(), 1);
+        assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn an_event_from_a_replaced_page_never_reaches_the_new_pages_tree_or_takes_its_edits() {
+        let scene = Scene::new();
+        let first = scene.edits.wry_queue.serve_page();
+        let old_element = scene.draw(first);
+        assert!(answered_with_edits(&scene.resize(old_element, Some(first))));
+        assert_eq!(heard(), 1);
+
+        let second = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(second);
+        let response = scene.resize(element, Some(first));
+        assert_eq!(
+            heard(),
+            1,
+            "The replaced page's event ran a handler in the new page's tree."
+        );
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+
+        let response = scene.resize(element, Some(second));
+        assert_eq!(heard(), 2);
+        assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn an_event_from_a_page_that_has_not_reported_in_is_dropped() {
+        let scene = Scene::new();
+        let first = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(first);
+        let arriving = scene.edits.wry_queue.serve_page();
+        let response = scene.resize(element, Some(arriving));
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+    }
+
+    #[test]
+    fn an_event_from_a_lost_page_is_dropped() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        scene.edits.wry_queue.forget_connection();
+        let response = scene.resize(element, Some(page));
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+    }
+
+    #[test]
+    fn an_event_that_does_not_name_its_page_is_dropped() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        let response = scene.resize(element, None);
+        assert_eq!(heard(), 0);
+        assert_eq!(response, serde_json::json!({ "preventDefault": false }));
     }
 }

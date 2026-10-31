@@ -1,15 +1,17 @@
 use crate::{
     config::{Config, WindowCloseBehaviour},
     desktop_state::{DesktopAppContext, WindowCloseRequestResult},
-    ipc::{IpcMessage, UserWindowEvent},
+    edits::Arrival,
+    ipc::{IpcMessage, PageReport, UserWindowEvent},
     query::QueryResult,
     waker::create_dom_waker,
-    webview::WebviewInstance,
+    webview::{SharedDom, WebviewInstance},
 };
 use dioxus_vdom::{RenderTargetId, ScopeId, VirtualDom, provide_context};
 use futures_util::{FutureExt, pin_mut};
 use std::{
-    collections::{BTreeMap, HashMap},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
     task::Waker,
     time::Duration,
@@ -21,9 +23,122 @@ use tao::{
     window::WindowId,
 };
 
+/// How long a page loaded again after being lost is given to report in
+/// before the load is taken to have failed and asked for again.
+///
+/// A page that loads at all reports in within a second or two. The wait
+/// has to cover the web content process being brought up first, since a
+/// load asked for while the platform is still launching that process is
+/// dropped on the floor, and only a load asked for once it is up begins:
+/// the clock is what turns a lost first load into a page.
+pub(crate) const PAGE_RELOAD_PATIENCE: Duration = Duration::from_secs(8);
+
+/// How many quick attempts a lost page is given before the asking slows to
+/// [`PAGE_RELOAD_PATIENCE_LATER`]. The asking never stops: a web content
+/// process has been seen to take over a minute to launch on a loaded
+/// machine, and a window given up on is a window that stays empty until
+/// the application is force quit, which is the very thing being cured.
+pub(crate) const PAGE_RELOAD_ATTEMPTS: u32 = 6;
+
+/// How long between attempts once the quick ones are spent.
+pub(crate) const PAGE_RELOAD_PATIENCE_LATER: Duration = Duration::from_secs(30);
+
+/// How soon after a page is asked for again a report of a page loaded is
+/// taken to be an earlier attempt's page, which the load just asked for is
+/// about to replace. The wait goes on past such a report. Only a retry can
+/// have an earlier attempt's page still loading: the first load after a loss
+/// follows a page whose process has ended, so whatever reports in then is
+/// the new page, however quickly it came. A telephone that keeps a renderer
+/// ready loads the page in well under this.
+pub(crate) const PAGE_REPORT_TOO_SOON: Duration = Duration::from_millis(400);
+
+/// How many times a load that has begun is given another period of patience
+/// to commit before it is taken to have stalled and asked for again. A load
+/// that has begun usually commits within a moment of its process being up,
+/// and asking again while it is on its way starts a second load racing the
+/// first; but a load begun while the application was in the background has
+/// been seen to sit uncommitted until asked for again, every second of the
+/// wait paid in front of the member, so the waiting is one period and no
+/// more.
+pub(crate) const PAGE_LOAD_BEGUN_WAITS: u32 = 1;
+
+/// A load of a lost page that has not reported in yet: which loss it
+/// recovers from, which attempt at that loss it is, and how many times the
+/// clock has found the load begun and waited on rather than asked again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingReload {
+    pub(crate) loss: u64,
+    pub(crate) attempt: u32,
+    pub(crate) begun_waits: u32,
+    /// Whether the clock ran out while the window was not in the foreground,
+    /// so the asking waits for the window to come back.
+    pub(crate) deferred: bool,
+    /// When the page was last asked for.
+    pub(crate) asked_at: std::time::Instant,
+}
+
+impl PendingReload {
+    pub(crate) fn is_an_earlier_attempts_page(&self, since_asked: Duration) -> bool {
+        self.attempt > 1 && !self.deferred && since_asked < PAGE_REPORT_TOO_SOON
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    fn pending(attempt: u32, deferred: bool) -> PendingReload {
+        PendingReload {
+            loss: 1,
+            attempt,
+            begun_waits: 0,
+            deferred,
+            asked_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn the_first_page_after_a_loss_is_the_new_page_however_soon_it_reports_in() {
+        assert!(
+            !pending(1, false).is_an_earlier_attempts_page(Duration::from_millis(15)),
+            "A page whose process ended cannot report in, so the first report is the new page."
+        );
+        assert!(!pending(1, false).is_an_earlier_attempts_page(Duration::from_millis(159)));
+    }
+
+    #[test]
+    fn a_report_just_after_a_retry_is_taken_for_the_page_it_replaces() {
+        assert!(pending(2, false).is_an_earlier_attempts_page(Duration::from_millis(20)));
+        assert!(pending(6, false).is_an_earlier_attempts_page(Duration::from_millis(399)));
+        assert!(
+            !pending(2, false).is_an_earlier_attempts_page(PAGE_REPORT_TOO_SOON),
+            "A report that comes a while after the retry is the retry's own page."
+        );
+        assert!(
+            !pending(2, true).is_an_earlier_attempts_page(Duration::from_millis(20)),
+            "A load that waited for the window to come back is taken as the page, as it always was."
+        );
+    }
+
+    #[test]
+    fn the_quick_attempts_are_quick_and_the_rest_are_slow_and_never_stop() {
+        for attempt in 1..=PAGE_RELOAD_ATTEMPTS {
+            assert_eq!(App::page_reload_patience(attempt), PAGE_RELOAD_PATIENCE);
+        }
+        for attempt in [PAGE_RELOAD_ATTEMPTS + 1, 20, 1_000, u32::MAX] {
+            assert_eq!(
+                App::page_reload_patience(attempt),
+                PAGE_RELOAD_PATIENCE_LATER
+            );
+        }
+        assert!(PAGE_RELOAD_PATIENCE < PAGE_RELOAD_PATIENCE_LATER);
+        assert!(PAGE_RELOAD_PATIENCE >= Duration::from_secs(5));
+    }
+}
+
 /// The single top-level object that manages the event loop, VirtualDom, and running windows.
 pub(crate) struct App {
-    pub(crate) dom: VirtualDom,
+    pub(crate) shared: SharedDom,
     pub(crate) initial_dom_rebuild_done: bool,
 
     /// Hot-reload messages that arrived before the initial DOM rebuild. Applying them (and
@@ -37,6 +152,21 @@ pub(crate) struct App {
     pub(crate) exit_on_last_window_close: bool,
     pub(crate) disable_dma_buf_on_wayland: bool,
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
+
+    /// For each window whose page is being loaded again, which loss is being
+    /// recovered from and how many times the load has been asked for. A
+    /// window is in here from the moment its page is found lost until the new
+    /// page reports in.
+    pub(crate) pending_reloads: HashMap<WindowId, PendingReload>,
+
+    /// Which windows are in the foreground. A window absent here is taken
+    /// to be in the foreground, as it is when it is first shown.
+    pub(crate) window_focus: HashMap<WindowId, bool>,
+
+    /// Every loss of a page is numbered, so that a clock started for one
+    /// loss cannot be mistaken for a clock started for a later one.
+    pub(crate) losses: u64,
+    pub(crate) drawn_windows: HashSet<WindowId>,
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
@@ -61,8 +191,15 @@ impl App {
             exit_on_last_window_close: cfg.exit_on_last_window_close,
             disable_dma_buf_on_wayland: cfg.disable_dma_buf_on_wayland,
             webviews: HashMap::new(),
+            pending_reloads: HashMap::new(),
+            window_focus: HashMap::new(),
+            losses: 0,
+            drawn_windows: HashSet::new(),
             control_flow: ControlFlow::Wait,
-            dom: virtual_dom,
+            shared: SharedDom {
+                dom: Rc::new(RefCell::new(virtual_dom)),
+                queues: Rc::new(RefCell::new(BTreeMap::new())),
+            },
             initial_dom_rebuild_done: false,
             #[cfg(all(feature = "devtools", debug_assertions))]
             pending_hot_reload_msgs: Vec::new(),
@@ -174,7 +311,7 @@ impl App {
 
     pub fn handle_new_window(&mut self) {
         for pending_webview in self.app_context.drain_pending_webviews() {
-            let app_webview = pending_webview.create_window(&mut self.dom, &self.app_context);
+            let app_webview = pending_webview.create_window(&self.shared, &self.app_context);
             let id = app_webview.desktop_context.window.id();
             self.webviews.insert(id, app_webview);
         }
@@ -216,6 +353,9 @@ impl App {
         let Some(app_webview) = self.webviews.remove(&id) else {
             return;
         };
+        self.pending_reloads.remove(&id);
+        self.window_focus.remove(&id);
+        self.drawn_windows.remove(&id);
         app_webview.desktop_context.notify_window_destroyed();
         let target_id = app_webview.target_id();
         // A component-owned `Window` reclaims its own target when its portal is
@@ -223,7 +363,12 @@ impl App {
         // (or the app is shutting down) before that teardown runs the portal is
         // still mounted; `remove_render_target` leaves such a target in place and
         // it is reclaimed when the runtime is dropped.
-        self.dom.runtime().remove_render_target(target_id);
+        self.shared.queues.borrow_mut().remove(&target_id);
+        self.shared
+            .dom
+            .borrow()
+            .runtime()
+            .remove_render_target(target_id);
 
         if self.exit_on_last_window_close && self.webviews.is_empty() {
             self.control_flow = ControlFlow::Exit
@@ -262,7 +407,7 @@ impl App {
 
     fn provide_app_context(&mut self) {
         let app_context = self.app_context.clone();
-        self.dom.in_scope(ScopeId::ROOT, || {
+        self.shared.dom.borrow().in_scope(ScopeId::ROOT, || {
             provide_context(app_context);
         });
     }
@@ -279,22 +424,301 @@ impl App {
         }
     }
 
-    /// The webview is finally loaded. Rebuild once, then start polling the
-    /// shared VDOM.
-    pub fn handle_initialize_msg(&mut self, id: WindowId) {
-        if !self.webviews.contains_key(&id) {
+    /// The process drawing a window's page has been terminated by the platform,
+    /// or the activity holding it has been created again.
+    ///
+    /// The application itself is untouched -- its state, its tasks and its
+    /// virtual dom are all still here -- but the page they were being drawn
+    /// into is gone, and what a member sees is an empty webview in whatever
+    /// colour it was told to paint. Loading the page again is all that is
+    /// needed: it reports in when it is ready, and the whole dom is rebuilt
+    /// into it from the virtual dom that never went anywhere.
+    ///
+    /// iOS does this to an application that has been in the background a while.
+    /// Android creates an activity again, and a new web view with it, to show a
+    /// configuration change the activity does not handle itself.
+    ///
+    /// The load is not trusted to finish. When the platform has taken the
+    /// networking process along with the web content process, or the GPU
+    /// process goes while the new page is still on its way, the load starts
+    /// and never commits, and a webview that never commits a load stays
+    /// empty for good. So the new page is given a while to report in, and if
+    /// it has not, the load is asked for again, up to a limit past which the
+    /// window is given up as lost rather than reloaded forever.
+    pub fn reload_lost_page(&mut self, id: WindowId) {
+        self.losses += 1;
+        self.load_lost_page(id, self.losses, 1);
+    }
+
+    /// The time an attempt to load a lost page again was given is up. If
+    /// that attempt is still the one being waited on, the page never reported
+    /// in, and it is loaded again; if the page has since reported in, a later
+    /// attempt has replaced this one, or the platform has reported the page
+    /// lost afresh, there is nothing to do.
+    pub fn page_reload_due(&mut self, id: WindowId, loss: u64, attempt: u32) {
+        let Some(pending) = self.pending_reloads.get(&id).copied() else {
+            return;
+        };
+        if pending.loss != loss || pending.attempt != attempt {
             return;
         }
 
-        if !self.initial_dom_rebuild_done {
-            self.rebuild_dom();
-            self.send_touched_edits();
+        // Nothing loads while the window is in the background: the platform
+        // holds the load until the window is back, and every load asked for
+        // meanwhile is one more page racing the others when it is. The
+        // asking waits for the window instead.
+        if !self.window_focus.get(&id).copied().unwrap_or(true) {
+            tracing::info!(
+                "The page has not reported in and the window is not in the foreground; it \
+                 will be asked for again when the window is."
+            );
+            self.pending_reloads.insert(
+                id,
+                PendingReload {
+                    deferred: true,
+                    ..pending
+                },
+            );
+            return;
+        }
 
-            #[cfg(all(feature = "devtools", debug_assertions))]
-            if self.initial_dom_rebuild_done {
-                for msg in std::mem::take(&mut self.pending_hot_reload_msgs) {
-                    self.handle_hot_reload_msg(msg);
-                }
+        // A load that is under way -- the page's document has been asked
+        // for, which happens only once the process drawing it is up -- is
+        // almost always about to commit and report in, and a second load
+        // asked for now would race it, so it is given more time first. A
+        // load merely asked for, with no process yet to load it, is not.
+        let begun = self
+            .webviews
+            .get(&id)
+            .map(|view| {
+                view.desktop_context
+                    .page_begun
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap_or(false);
+        if begun && pending.begun_waits < PAGE_LOAD_BEGUN_WAITS {
+            let patience = Self::page_reload_patience(attempt);
+            tracing::info!(
+                "The page's load has begun but it has not reported in within {patience:?}; \
+                 it is given another {patience:?} before being asked for again."
+            );
+            self.pending_reloads.insert(
+                id,
+                PendingReload {
+                    begun_waits: pending.begun_waits + 1,
+                    ..pending
+                },
+            );
+            self.start_reload_clock(id, loss, attempt, patience);
+            return;
+        }
+
+        if attempt >= PAGE_RELOAD_ATTEMPTS {
+            tracing::error!(
+                "The page was loaded {attempt} times after its web content process was \
+                 terminated and has not reported in; it is being loaded once more, and \
+                 will be every {PAGE_RELOAD_PATIENCE_LATER:?} until it does."
+            );
+        } else {
+            tracing::warn!(
+                "The page did not report in within {PAGE_RELOAD_PATIENCE:?} of being loaded \
+                 again, so it is being loaded once more (attempt {} of {PAGE_RELOAD_ATTEMPTS}).",
+                attempt + 1
+            );
+        }
+        self.load_lost_page(id, loss, attempt + 1);
+    }
+
+    /// The window has come to the foreground or left it.
+    ///
+    /// A page lost while the window was in the background has had its clock
+    /// deferred; now that the window is back, the load the platform held is
+    /// given one period to report in, and asked for again if it does not.
+    pub fn window_focus_changed(&mut self, id: WindowId, focused: bool) {
+        self.window_focus.insert(id, focused);
+        if !focused {
+            return;
+        }
+        let Some(pending) = self.pending_reloads.get(&id).copied() else {
+            return;
+        };
+        if !pending.deferred {
+            return;
+        }
+        self.pending_reloads.insert(
+            id,
+            PendingReload {
+                deferred: false,
+                ..pending
+            },
+        );
+        tracing::info!(
+            "The window is back in the foreground with its page still awaited; the page is \
+             given {PAGE_RELOAD_PATIENCE:?} to report in."
+        );
+        self.start_reload_clock(id, pending.loss, pending.attempt, PAGE_RELOAD_PATIENCE);
+    }
+
+    /// How long an attempt is given: the quick ones a few seconds, the rest
+    /// half a minute, so a machine slow to bring a process up is asked
+    /// again rather than given up on, and not asked so often it never gets
+    /// there.
+    fn page_reload_patience(attempt: u32) -> Duration {
+        if attempt <= PAGE_RELOAD_ATTEMPTS {
+            PAGE_RELOAD_PATIENCE
+        } else {
+            PAGE_RELOAD_PATIENCE_LATER
+        }
+    }
+
+    /// Loads a lost page again and starts the clock on its reporting in.
+    ///
+    /// A loss reported by the platform is attempt one, whatever came before
+    /// it: a page lost afresh is a new loss, not a failed attempt at the last
+    /// one. Only the attempts this clock asks for count toward the slowing.
+    fn load_lost_page(&mut self, id: WindowId, loss: u64, attempt: u32) {
+        let Some(view) = self.webviews.get(&id) else {
+            return;
+        };
+        self.pending_reloads.insert(
+            id,
+            PendingReload {
+                loss,
+                attempt,
+                begun_waits: 0,
+                deferred: false,
+                asked_at: std::time::Instant::now(),
+            },
+        );
+
+        // Every navigation to the page is allowed while it is awaited, and
+        // the flag the guard reads once the page is back is cleared so that
+        // the clock can tell whether this load has begun.
+        view.desktop_context
+            .page_awaited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        view.desktop_context
+            .page_loaded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        view.desktop_context
+            .page_begun
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // The page that died never closed its connection, so what is sent next
+        // would go to a channel nothing is reading. Forgetting it first means
+        // the edits that rebuild the new page are queued for it instead.
+        {
+            #[cfg(target_os = "android")]
+            let _lock = crate::android_sync_lock::android_runtime_lock();
+            view.edits.wry_queue.forget_connection();
+        }
+
+        if let Err(error) = view
+            .desktop_context
+            .webview
+            .load_url(crate::protocol::PageAddress::THIS_PLATFORM.index())
+        {
+            tracing::error!(
+                "The page could not be loaded again after its web content process was \
+                 terminated, so the window will stay empty: {error}"
+            );
+        }
+
+        self.start_reload_clock(id, loss, attempt, Self::page_reload_patience(attempt));
+    }
+
+    fn start_reload_clock(&self, id: WindowId, loss: u64, attempt: u32, patience: Duration) {
+        let proxy = self.app_context.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(patience);
+            _ = proxy.send_event(UserWindowEvent::PageReloadDue { id, loss, attempt });
+        });
+    }
+
+    /// The webview is finally loaded. Rebuild, then start polling the shared
+    /// VDOM.
+    ///
+    /// The page names itself when it reports in. Only a page newer than every
+    /// page that has reported in before is rebuilt into, so a page is rebuilt
+    /// into once, and a page that has been replaced is never rebuilt into
+    /// again however late its report comes.
+    ///
+    /// A window's first page is drawn as every page was before any could be
+    /// lost: the first page of the application has the dom rebuilt into it,
+    /// and a later window's first page is sent what its window rendered. Every
+    /// page after a window's first has replaced one that was lost, and the
+    /// window's render target is rebuilt into it as into a new page, with the
+    /// head put back.
+    pub fn handle_initialize_msg(&mut self, id: WindowId, msg: IpcMessage) {
+        let Ok(PageReport { page }) = serde_json::from_value::<PageReport>(msg.params()) else {
+            tracing::warn!(
+                "A page reported in without naming itself, so nothing is drawn into it."
+            );
+            return;
+        };
+
+        let Some(view) = self.webviews.get(&id) else {
+            return;
+        };
+
+        #[cfg(target_os = "android")]
+        let _lock = crate::android_sync_lock::android_runtime_lock();
+
+        if let Arrival::Stale { newest } = view.edits.wry_queue.page_arrived(page) {
+            tracing::info!(
+                "Page {page} reported in after page {newest} had, so it is not drawn into."
+            );
+            return;
+        }
+
+        if let Some(pending) = self.pending_reloads.get(&id).copied() {
+            let since_asked = pending.asked_at.elapsed();
+            if pending.is_an_earlier_attempts_page(since_asked) {
+                tracing::warn!(
+                    "A page reported in {since_asked:?} after the page was asked for again, so it \
+                     is the page being replaced; it is drawn into, and the wait for the one \
+                     asked for goes on."
+                );
+            } else {
+                self.pending_reloads.remove(&id);
+                tracing::info!("The page loaded again and reported in.");
+            }
+        }
+
+        // The page is back, and from here the guard lets it load exactly once
+        // more only when it is lost again.
+        view.desktop_context
+            .page_awaited
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        view.desktop_context
+            .page_loaded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let target_id = view.target_id();
+
+        let first_page = self.drawn_windows.insert(id);
+        let replaced = if !self.initial_dom_rebuild_done {
+            self.rebuild_dom();
+            false
+        } else if first_page {
+            false
+        } else {
+            self.rebuild_target_into_a_new_page(target_id);
+            true
+        };
+        self.send_touched_edits();
+
+        // Anything the document put into the head belongs to the page that had
+        // it, and a page that has replaced another starts with an empty one.
+        // The remembered elements are restored immediately while the remounted
+        // component tree prepares its effects.
+        if replaced && let Some(view) = self.webviews.get(&id) {
+            view.desktop_context.replay_head_elements();
+        }
+
+        #[cfg(all(feature = "devtools", debug_assertions))]
+        if self.initial_dom_rebuild_done {
+            for msg in std::mem::take(&mut self.pending_hot_reload_msgs) {
+                self.handle_hot_reload_msg(msg);
             }
         }
 
@@ -339,7 +763,9 @@ impl App {
                         #[cfg(target_os = "android")]
                         let _lock = crate::android_sync_lock::android_runtime_lock();
 
-                        if let Err(err) = dioxus_devtools::try_apply_changes(&self.dom, &hr_msg) {
+                        if let Err(err) =
+                            dioxus_devtools::try_apply_changes(&self.shared.dom.borrow(), &hr_msg)
+                        {
                             tracing::error!("Failed to apply hot-patch: {err}");
                             patch_error = Some(err);
                         }
@@ -447,7 +873,8 @@ impl App {
                 // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers and async tasks
                 #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
-                let fut = self.dom.wait_for_work();
+                let mut dom = self.shared.dom.borrow_mut();
+                let fut = dom.wait_for_work();
                 pin_mut!(fut);
 
                 match fut.poll_unpin(&mut cx) {
@@ -481,15 +908,23 @@ impl App {
     fn rebuild_dom(&mut self) {
         let mut writer = self.dom_writer();
         let has_render_targets = !writer.is_empty();
-        self.dom.rebuild(&mut writer);
+        self.shared.dom.borrow_mut().rebuild(&mut writer);
         if has_render_targets {
             self.initial_dom_rebuild_done = true;
         }
     }
 
+    fn rebuild_target_into_a_new_page(&mut self, target_id: RenderTargetId) {
+        let mut writer = self.dom_writer();
+        self.shared
+            .dom
+            .borrow_mut()
+            .rebuild_target_into_a_new_page(target_id, &mut writer);
+    }
+
     fn render_dom_immediate(&mut self) {
         let mut writer = self.dom_writer();
-        self.dom.render_immediate(&mut writer);
+        self.shared.dom.borrow_mut().render_immediate(&mut writer);
     }
 
     /// Flush queued edits for every webview whose `WryQueue` was touched during

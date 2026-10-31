@@ -81,11 +81,16 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 WindowEvent::CloseRequested => app.handle_close_requested(window_id),
                 WindowEvent::Destroyed { .. } => app.window_destroyed(window_id),
                 WindowEvent::Resized(new_size) => app.resize_window(window_id, new_size),
+                WindowEvent::Focused(focused) => app.window_focus_changed(window_id, focused),
                 _ => {}
             },
 
             Event::UserEvent(event) => match event {
                 UserWindowEvent::Poll => app.poll_vdom(),
+                UserWindowEvent::PageLost(id) => app.reload_lost_page(id),
+                UserWindowEvent::PageReloadDue { id, loss, attempt } => {
+                    app.page_reload_due(id, loss, attempt)
+                }
                 UserWindowEvent::NewWindow => app.handle_new_window(),
                 UserWindowEvent::RequestWindowClose(id) => app.handle_close_requested(id),
                 UserWindowEvent::DestroyWindow(id) => app.destroy_window(id),
@@ -135,7 +140,7 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 }
 
                 UserWindowEvent::Ipc { id, msg } => match msg.method() {
-                    IpcMethod::Initialize => app.handle_initialize_msg(id),
+                    IpcMethod::Initialize => app.handle_initialize_msg(id, msg),
                     IpcMethod::UserEvent => {}
                     IpcMethod::Query => app.handle_query_msg(msg, id),
                     IpcMethod::BrowserOpen => app.handle_browser_open(msg),

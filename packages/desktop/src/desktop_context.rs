@@ -3,10 +3,12 @@ use crate::{
     assets::AssetHandlerRegistry,
     desktop_state::{DesktopAppContext, DesktopWindowContext, WindowCloseRequestResult},
     file_upload::NativeFileHover,
+    head_record::{HeadInsertion, HeadRecord},
     ipc::UserWindowEvent,
     shortcut::{HotKey, HotKeyState, ShortcutHandle, ShortcutRegistryError},
 };
 use dioxus_vdom::{Callback, RenderTargetId};
+use std::cell::RefCell;
 use std::{
     cell::Cell,
     future::{Future, IntoFuture},
@@ -102,6 +104,32 @@ impl PendingWindowCancellation {
 pub struct DesktopService {
     pub(crate) app: Rc<DesktopAppContext>,
     window_context: DesktopWindowContext,
+
+    /// Whether the window's page has been loaded once. The navigation guard
+    /// refuses every load of the page after the first, so that a link in the
+    /// page cannot navigate the window away; a page that is lost is loaded
+    /// again by clearing this first.
+    pub(crate) page_loaded: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Whether the window's page is gone and its replacement has yet to
+    /// report in. While it is, every load of the page is allowed, not just
+    /// the first: see the navigation guard.
+    pub(crate) page_awaited: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Whether the page's document has been asked for since the page was
+    /// last lost: a load that is under way, not merely asked for.
+    pub(crate) page_begun: Arc<std::sync::atomic::AtomicBool>,
+
+    /// The head elements this window's document has put into its page.
+    ///
+    /// Kept because a page can be replaced underneath a running application --
+    /// the platform terminates the process drawing it and it is loaded again --
+    /// and the replacement must receive these elements before remounted effects
+    /// run. Without this record, the new page can initially have an empty head
+    /// and render without styling. Every replacement receives all of them, not
+    /// only the first: a remounted component that de-duplicates what it puts
+    /// into the head, as a stylesheet link does, never puts it in again.
+    pub(crate) head_elements: RefCell<HeadRecord>,
 }
 
 /// A smart pointer to the current window context.
@@ -114,6 +142,7 @@ impl std::ops::Deref for DesktopService {
 }
 
 impl DesktopService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         webview: WebView,
         window: Arc<Window>,
@@ -122,6 +151,9 @@ impl DesktopService {
         asset_handlers: AssetHandlerRegistry,
         file_hover: NativeFileHover,
         close_behaviour: WindowCloseBehaviour,
+        page_loaded: Arc<std::sync::atomic::AtomicBool>,
+        page_awaited: Arc<std::sync::atomic::AtomicBool>,
+        page_begun: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             app,
@@ -133,6 +165,10 @@ impl DesktopService {
                 file_hover,
                 close_behaviour,
             ),
+            page_loaded,
+            page_awaited,
+            page_begun,
+            head_elements: RefCell::new(HeadRecord::default()),
         }
     }
 
@@ -159,6 +195,27 @@ impl DesktopService {
 
     pub(crate) fn notify_window_destroyed(&self) {
         self.window_context.notify_window_destroyed();
+    }
+
+    /// Loads the window's page again, from the virtual dom that never went
+    /// anywhere.
+    ///
+    /// For a page the application has found lost: on screen but showing
+    /// nothing of what the virtual dom holds, and not answering. The platform
+    /// reclaims a page's process from an application in the background and
+    /// says so, and that case is handled without being asked; this is for the
+    /// cases it does not say so, which an application notices by asking the
+    /// page a question and getting no answer. The page is loaded once more,
+    /// the virtual dom is rebuilt into it, and the head is put back.
+    pub fn reload_lost_page(&self) {
+        self.page_awaited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.page_loaded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        _ = self
+            .app
+            .proxy
+            .send_event(UserWindowEvent::PageLost(self.window.id()));
     }
 
     /// Start the creation of a new window using the props and window builder
@@ -215,6 +272,31 @@ impl DesktopService {
     /// Toggle whether the window is maximized or not
     pub fn toggle_maximized(&self) {
         self.window.set_maximized(!self.window.is_maximized())
+    }
+
+    /// Records a script that puts an element into the head, so that it can be
+    /// put into a page that replaces this one.
+    pub(crate) fn remember_head_element(&self, js: String) -> HeadInsertion {
+        self.head_elements.borrow_mut().remember(js)
+    }
+
+    /// Puts every remembered head element into the page again.
+    ///
+    /// Called once a page that replaced another is ready, however many pages
+    /// were replaced before it. On a page that replaced nothing there is
+    /// nothing remembered yet, so this does nothing.
+    pub(crate) fn replay_head_elements(&self) {
+        let scripts = self.head_elements.borrow_mut().replay();
+        if scripts.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            "Putting {} head elements back into the new page.",
+            scripts.len()
+        );
+        for js in scripts {
+            self.webview.evaluate_script(&js).ok();
+        }
     }
 
     /// Set the close behavior of this window

@@ -18,6 +18,7 @@ mod element;
 mod event_handlers;
 mod events;
 mod file_upload;
+mod head_record;
 mod hooks;
 mod ipc;
 mod menubar;
@@ -63,6 +64,7 @@ pub use desktop_context::{
 pub use desktop_state::DesktopAppContext;
 pub use event_handlers::WryEventHandler;
 pub use hooks::*;
+pub use ipc::UserWindowEvent;
 pub use shortcut::{HotKeyState, ShortcutHandle, ShortcutRegistryError};
 pub use window_component::{Window, WindowProps};
 pub use wry::RequestAsyncResponder;

@@ -1,24 +1,49 @@
 use serde::{Deserialize, Serialize};
 use tao::window::WindowId;
 
+/// The events the desktop renderer sends itself through the event loop.
+///
+/// An application sees them through `use_wry_event_handler`, and may act on
+/// the ones that concern it -- a page lost to the platform, say -- while the
+/// renderer does its own part.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub enum UserWindowEvent {
     /// A global hotkey event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     GlobalHotKeyEvent(global_hotkey::GlobalHotKeyEvent),
 
+    /// A menu bar event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     MudaMenuEvent(muda::MenuEvent),
 
+    /// A tray icon event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     TrayIconEvent(tray_icon::TrayIconEvent),
 
+    /// A tray menu event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     TrayMenuEvent(tray_icon::menu::MenuEvent),
 
     /// Poll the shared VirtualDom.
     Poll,
+
+    /// This window's page is lost - the process drawing it was terminated
+    /// by the platform, the activity holding it was created again, or the
+    /// page is on screen showing nothing of what the virtual dom holds - and
+    /// has to be loaded again.
+    PageLost(WindowId),
+
+    /// The time a lost page was given to load again is up. If the page has
+    /// still not reported in, this attempt failed, and another is made. The
+    /// loss is named so that a clock started for an earlier loss of the same
+    /// window says nothing about a later one.
+    PageReloadDue {
+        id: WindowId,
+        loss: u64,
+        attempt: u32,
+    },
 
     /// Handle an ipc message eminating from the window.postMessage of a given webview
     Ipc {
@@ -55,6 +80,12 @@ pub enum UserWindowEvent {
 pub struct IpcMessage {
     method: String,
     params: serde_json::Value,
+}
+
+/// What a page says when it reports in: which page it is.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageReport {
+    pub(crate) page: crate::edits::Page,
 }
 
 /// A set of known messages that we need to respond to

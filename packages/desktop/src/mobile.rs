@@ -22,7 +22,7 @@ pub extern "C" fn start_app() {
     // `ndk_context` is left as tao initialized it, with the Application context.
     unsafe fn android_setup(
         package: &str,
-        env: ::wry::prelude::JNIEnv<'_>,
+        mut env: ::wry::prelude::JNIEnv<'_>,
         looper: &::ndk::looper::ThreadLooper,
         activity: ::wry::prelude::GlobalRef,
     ) {
