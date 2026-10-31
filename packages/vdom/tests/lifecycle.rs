@@ -11,6 +11,74 @@ use std::sync::{Arc, Mutex};
 
 type Shared<T> = Arc<Mutex<T>>;
 
+#[derive(Clone, Default)]
+struct PageTracker {
+    created: Arc<std::sync::atomic::AtomicUsize>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PageLease(PageTracker);
+
+impl PageLease {
+    fn new(tracker: PageTracker) -> Self {
+        tracker
+            .created
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracker
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(tracker)
+    }
+}
+
+impl Drop for PageLease {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn new_page_app() -> Element {
+    let tracker = consume_context::<PageTracker>();
+    let _lease = use_hook(|| Rc::new(PageLease::new(tracker)));
+    rsx! { div { "Recovered" } }
+}
+
+#[test]
+fn a_new_page_replaces_the_mounted_component_tree() {
+    let tracker = PageTracker::default();
+    let mut dom = VirtualDom::new(new_page_app).with_root_context(tracker.clone());
+    dom.rebuild(&mut dioxus_vdom::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    dom.rebuild_into_a_new_page(&mut dioxus_vdom::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    dom.rebuild_into_a_new_page(&mut dioxus_vdom::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    drop(dom);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_new_page_can_be_built_from_a_dom_never_mounted() {
+    let tracker = PageTracker::default();
+    let mut dom = VirtualDom::new(new_page_app).with_root_context(tracker.clone());
+
+    dom.rebuild_into_a_new_page(&mut dioxus_vdom::NoOpMutations);
+
+    assert_eq!(tracker.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tracker.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[test]
 fn manual_diffing() {
     #[derive(Clone)]

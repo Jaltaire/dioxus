@@ -2,6 +2,7 @@ use std::{any::Any, marker::PhantomData, rc::Rc};
 
 use crate::{
     RenderTargetId,
+    arena::RenderTargetState,
     diff::{CreatedVNode, context::DiffContext},
     innerlude::*,
     mutations::append_children_to_with_result,
@@ -275,6 +276,70 @@ fn place_children_inner(
     children
         .as_vnode()
         .create_or_reuse_mount(dom, old_root_mount, parent, parent, to)
+}
+
+pub(crate) fn rebuild_portals_into_a_new_page(
+    dom: &mut VirtualDom,
+    target_id: RenderTargetId,
+    to: &mut dyn WriteMutations,
+) {
+    let mut portals: Vec<(u32, ScopeId)> = dom
+        .scopes
+        .iter()
+        .map(|(index, _)| ScopeId::new(index))
+        .filter(|&scope_id| {
+            let scope = &dom.scopes[scope_id.index()];
+            scope.last_rendered_node.is_some()
+                && scope.props.props().downcast_ref::<PortalProps>().is_some()
+                && dom.runtime.get_state(scope_id).target_id() == target_id
+        })
+        .map(|scope_id| (dom.runtime.get_state(scope_id).height, scope_id))
+        .collect();
+    portals.sort();
+
+    let mut placements = Vec::new();
+    for (_, scope_id) in portals {
+        if !dom.scopes.contains(scope_id.index()) {
+            continue;
+        }
+        dom.runtime.clone().with_scope_on_stack(scope_id, || {
+            let Some(old_output) = dom.scopes[scope_id.index()].last_rendered_node.take() else {
+                return;
+            };
+            let old_mount = old_output.root_mount();
+            let logical_parent = dom.mounted_logical_parent(old_mount);
+            let render_parent = dom.mounted_render_parent(old_mount);
+            old_output
+                .as_vnode()
+                .remove_node_inner(old_mount, dom, None, true);
+            placements.push((scope_id, logical_parent, render_parent));
+        });
+    }
+
+    dom.runtime.render_targets.borrow_mut()[target_id.index()] = RenderTargetState::new();
+
+    for (scope_id, logical_parent, render_parent) in placements {
+        if !dom.scopes.contains(scope_id.index()) {
+            continue;
+        }
+        let (target_id, children) = portal_props(dom, scope_id);
+        dom.runtime.clone().while_rendering(|| {
+            dom.runtime.clone().with_scope_on_stack(scope_id, || {
+                let root_mount = place_children(
+                    scope_id,
+                    target_id,
+                    children,
+                    None,
+                    logical_parent,
+                    dom,
+                    Some(&mut *to),
+                );
+                if let Some(render_parent) = render_parent {
+                    dom.set_mounted_render_parent(root_mount, render_parent);
+                }
+            })
+        });
+    }
 }
 
 impl RenderDriver for PortalDriver {

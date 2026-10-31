@@ -6,8 +6,8 @@ use crate::innerlude::{VProps, Work};
 use crate::properties::RootProps;
 use crate::root_wrapper::RootScopeWrapper;
 use crate::{
-    ComponentFunction, Element, Mutations, NoOpMutations,
-    arena::ElementId,
+    ComponentFunction, Element, Mutations, NoOpMutations, RenderTargetId,
+    arena::{ElementId, RenderTargetState},
     innerlude::{SchedulerMsg, ScopeOrder, ScopeState, WriteMutations},
     mutations::append_children_to,
     runtime::{Runtime, RuntimeGuard},
@@ -565,6 +565,67 @@ impl VirtualDom {
         // hosts ignore the same mutation stream as every other renderer.
         let mut router = crate::mutations::TargetRouter::new(to, self.runtime.clone());
         self.rebuild_with_writer(&mut router);
+    }
+
+    /// Performs a *full* rebuild into a page that has replaced the one the dom was rendered into.
+    ///
+    /// The page the dom was rendered into is gone -- the platform took the process drawing it --
+    /// and a new, empty one stands in its place. What was rendered into the old page is
+    /// forgotten first: every scope below the root is dropped and every task those scopes
+    /// spawned is cancelled, without a single mutation, since there is no page left for a
+    /// mutation to reach. So is what the dom kept of the old page itself, the element ids it
+    /// handed out there and the template prototypes it built there to clone, since the new
+    /// page holds none of them. Then the dom is rebuilt into the new page as
+    /// [`VirtualDom::rebuild`] would build it into a first one.
+    ///
+    /// Rebuilding without forgetting leaves the old scopes alive but unreachable, so a task
+    /// they spawned -- a timer, a player, a poll -- runs on beside its replacement for as
+    /// long as the application does.
+    ///
+    /// On a dom that has never been rendered this is exactly [`VirtualDom::rebuild`].
+    #[instrument(
+        skip(self, to),
+        level = "trace",
+        name = "VirtualDom::rebuild_into_a_new_page"
+    )]
+    pub fn rebuild_into_a_new_page(&mut self, to: &mut impl crate::MultiWriter) {
+        {
+            let _runtime = RuntimeGuard::new(self.runtime.clone());
+            if let Some(rendered) = self.scopes[ScopeId::ROOT.index()].last_rendered_node.take() {
+                rendered
+                    .as_vnode()
+                    .remove_node_inner(rendered.root_mount(), self, None, true);
+            }
+            self.runtime.render_targets.borrow_mut()[RenderTargetId::ROOT.index()] =
+                RenderTargetState::new();
+        }
+        self.rebuild(to);
+    }
+
+    /// Performs a *full* rebuild of one render target into a page that has replaced the one the
+    /// target was rendered into, leaving every other target as it is.
+    ///
+    /// The root target is rebuilt as [`VirtualDom::rebuild_into_a_new_page`] rebuilds it. Any
+    /// other target is rebuilt from the portals that render into it: what they rendered is
+    /// forgotten, along with their scopes, their tasks, and what the dom kept of the old page,
+    /// and each is placed into the new page as on its first create.
+    #[instrument(
+        skip(self, to),
+        level = "trace",
+        name = "VirtualDom::rebuild_target_into_a_new_page"
+    )]
+    pub fn rebuild_target_into_a_new_page(
+        &mut self,
+        target: RenderTargetId,
+        to: &mut impl crate::MultiWriter,
+    ) {
+        if target == RenderTargetId::ROOT {
+            self.rebuild_into_a_new_page(to);
+            return;
+        }
+        let _runtime = RuntimeGuard::new(self.runtime.clone());
+        let mut router = crate::mutations::TargetRouter::new(to, self.runtime.clone());
+        crate::portal::rebuild_portals_into_a_new_page(self, target, &mut router);
     }
 
     /// Render whatever the VirtualDom has ready as fast as possible without
