@@ -1,6 +1,6 @@
 //! Android-specific utilities for mobile APIs
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 pub mod activity;
 #[cfg(target_os = "android")]
 pub mod callback;
