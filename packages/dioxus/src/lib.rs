@@ -142,6 +142,7 @@ pub use subsecond;
 pub use dioxus_asset_resolver as asset_resolver;
 
 pub mod prelude {
+    pub use dioxus_core::prelude::Result;
     pub use dioxus_core::prelude::*;
 
     #[cfg(feature = "document")]

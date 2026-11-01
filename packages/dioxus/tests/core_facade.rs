@@ -56,3 +56,11 @@ fn App() -> Element {
     let count = use_signal(|| 0);
     rsx! { div { "{count}" } }
 }
+
+#[test]
+fn the_prelude_result_is_the_virtual_dom_s() {
+    assert_eq!(
+        std::any::TypeId::of::<Result<u8>>(),
+        std::any::TypeId::of::<dioxus::dioxus_vdom::Result<u8>>()
+    );
+}
