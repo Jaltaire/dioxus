@@ -370,7 +370,7 @@ export class BaseInterpreter {
     node.setAttribute("data-dioxus-id", `${id}`);
 
     if (event_name === "mounted") {
-      this.sendSerializedEvent({
+      this.sendMountedEvent({
         name: event_name,
         element: id,
         data: null,

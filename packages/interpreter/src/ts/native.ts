@@ -385,6 +385,19 @@ export class NativeInterpreter extends JSChannel_ {
     }
   }
 
+  sendMountedEvent(body: {
+    name: string;
+    element: number;
+    data: any;
+    bubbles: boolean;
+  }) {
+    if (this.liveview) {
+      this.sendSerializedEvent(body);
+    } else {
+      this.sendIpcMessage("user_event", { ...body, page: this.page });
+    }
+  }
+
   sendSerializedEvent(body: {
     name: string;
     element: number;

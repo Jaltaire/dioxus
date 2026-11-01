@@ -13,14 +13,19 @@ pub fn method(script: &str, name: &str) -> String {
                 && rest[close + 1..].starts_with('{')
         })
         .unwrap_or_else(|| panic!("The shipped interpreter has {name}."));
+    let body = start
+        + script[start..]
+            .find("){")
+            .expect("A method's parameters close before its body.")
+        + 1;
     let mut depth = 0usize;
-    for (offset, character) in script[start..].char_indices() {
+    for (offset, character) in script[body..].char_indices() {
         match character {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return script[start..start + offset + 1].to_string();
+                    return script[start..body + offset + 1].to_string();
                 }
             }
             _ => {}

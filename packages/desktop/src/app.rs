@@ -729,6 +729,29 @@ impl App {
         self.schedule_poll();
     }
 
+    pub fn handle_user_event_msg(&mut self, msg: IpcMessage, id: WindowId) {
+        let Some((page, event)) = msg.page_event() else {
+            tracing::warn!("An event that does not name the page it came from is dropped.");
+            return;
+        };
+
+        let Some(view) = self.webviews.get(&id) else {
+            return;
+        };
+
+        #[cfg(target_os = "android")]
+        let _lock = crate::android_sync_lock::android_runtime_lock();
+
+        if !view.edits.wry_queue.is_drawn(page) {
+            tracing::info!(
+                "An event from page {page}, which is not the page being drawn into, is dropped."
+            );
+            return;
+        }
+
+        view.edits.handle_html_event(event);
+    }
+
     pub fn handle_query_msg(&mut self, msg: IpcMessage, id: WindowId) {
         let Ok(result) = serde_json::from_value::<QueryResult>(msg.params()) else {
             return;

@@ -112,4 +112,75 @@ impl IpcMessage {
     pub(crate) fn params(self) -> serde_json::Value {
         self.params
     }
+
+    pub(crate) fn page_event(self) -> Option<(crate::edits::Page, dioxus_html::HtmlEvent)> {
+        let serde_json::Value::Object(mut fields) = self.params else {
+            return None;
+        };
+        let page = serde_json::from_value(fields.remove("page")?).ok()?;
+        let event = serde_json::from_value(serde_json::Value::Object(fields)).ok()?;
+        Some((page, event))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpcMessage;
+    use dioxus_html::EventData;
+    use dioxus_vdom::ElementId;
+
+    fn message(params: serde_json::Value) -> IpcMessage {
+        serde_json::from_value(serde_json::json!({ "method": "user_event", "params": params }))
+            .expect("A message is read from its method and parameters.")
+    }
+
+    #[test]
+    fn an_event_that_names_its_page_is_read_with_that_page() {
+        let (page, event) = message(serde_json::json!({
+            "name": "mounted",
+            "element": 5,
+            "data": null,
+            "bubbles": false,
+            "page": 3,
+        }))
+        .page_event()
+        .expect("An event naming its page is read.");
+        assert_eq!(page.to_string(), "3");
+        assert_eq!(event.name, "mounted");
+        assert_eq!(event.element, ElementId::from_raw(5));
+        assert!(!event.bubbles);
+        assert!(matches!(event.data, EventData::Mounted));
+    }
+
+    #[test]
+    fn an_event_that_does_not_name_its_page_is_not_read() {
+        assert!(
+            message(serde_json::json!({
+                "name": "mounted",
+                "element": 5,
+                "data": null,
+                "bubbles": false,
+            }))
+            .page_event()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parameters_that_are_not_an_object_hold_no_event() {
+        assert!(
+            message(serde_json::json!([3, "mounted"]))
+                .page_event()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_event_beside_it_holds_no_event() {
+        assert!(
+            message(serde_json::json!({ "page": 3, "element": 5 }))
+                .page_event()
+                .is_none()
+        );
+    }
 }
