@@ -6,36 +6,7 @@
 
 use dioxus_interpreter_js::NATIVE_JS;
 
-/// The text of a method of the shipped native interpreter, from its name to
-/// its closing brace.
-fn method(name: &str) -> String {
-    let opening = format!("{name}(");
-    let start = NATIVE_JS
-        .match_indices(&opening)
-        .map(|(at, _)| at)
-        .find(|at| {
-            let before = NATIVE_JS[..*at].chars().next_back();
-            let rest = &NATIVE_JS[*at..];
-            let close = rest.find(')').expect("A method's parameters close.");
-            !before.is_some_and(|character| character == '.' || character.is_alphanumeric())
-                && rest[close + 1..].starts_with('{')
-        })
-        .unwrap_or_else(|| panic!("The shipped interpreter has {name}."));
-    let mut depth = 0usize;
-    for (offset, character) in NATIVE_JS[start..].char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return NATIVE_JS[start..start + offset + 1].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("{name} never closes.");
-}
+mod common;
 
 /// Runs `call` against a page holding one element of `kind` under the id 7,
 /// with every element query of the shipped interpreter defined on it, and
@@ -52,7 +23,7 @@ fn asked(kind: &str, call: &str) -> String {
         "setFocus",
     ]
     .into_iter()
-    .map(method)
+    .map(|name| common::method(NATIVE_JS, name))
     .collect();
     let program = format!(
         r#"
