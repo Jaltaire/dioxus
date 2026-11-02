@@ -17231,7 +17231,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "wry"
 version = "0.57.1"
-source = "git+https://github.com/Jaltaire/wry?branch=main-jaltaire#87005188899779c0a00556f8a96a124bbec20cec"
+source = "git+https://github.com/Jaltaire/wry?branch=main-jaltaire#0d91228d5f6d35854e04e2d9b19fb7a26cf10bd6"
 dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
