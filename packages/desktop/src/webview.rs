@@ -173,7 +173,6 @@ impl WebviewEdits {
         let response = match serde_json::from_slice(&data_from_header) {
             Ok(event) => {
                 // we need to wait for the mutex lock to let us munge the main thread..
-                #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
                 match page {
                     Some(page) if self.wry_queue.is_drawn(page) => self.handle_html_event(event),
@@ -321,19 +320,25 @@ impl WebviewEdits {
 /// Our handlers hold `Rc`s and are not thread safe. Wry only calls them on the thread that created
 /// the webview, except on Android where they run on WebView worker threads. Wry used to hold a
 /// mutex around those calls and its removal of the handler, and since 0.56 no longer does, so
-/// `with` and `drop` take a lock of our own there.
-struct ProtocolHandler<F> {
+/// `with` takes a lock of our own there, and the runtime lock the event loop holds, so that no
+/// call runs while the event loop touches what the handler reaches. On Android wry drops the
+/// handler on the activity's thread or a WebView worker thread, so `drop` hands it to the event
+/// loop, which drops it holding the runtime lock.
+struct ProtocolHandler<F: 'static> {
     handler: std::mem::ManuallyDrop<F>,
     #[cfg(not(target_os = "android"))]
     created_on: std::thread::ThreadId,
 }
 
 // SAFETY: upheld by the caller of `new`. `with` checks the calling thread, or locks on Android,
-// where `drop` locks too.
+// where `drop` leaves the handler for `drop_deferred_handlers` to drop on the event loop's
+// thread, holding the runtime lock, which is all a `Deferred` is ever used for.
 unsafe impl<F> Send for ProtocolHandler<F> {}
 unsafe impl<F> Sync for ProtocolHandler<F> {}
+#[cfg(any(target_os = "android", test))]
+unsafe impl Send for Deferred {}
 
-impl<F> ProtocolHandler<F> {
+impl<F: 'static> ProtocolHandler<F> {
     /// # Safety
     ///
     /// `handler` must only be handed to wry as a custom protocol handler, from the thread that
@@ -356,29 +361,60 @@ impl<F> ProtocolHandler<F> {
 
         #[cfg(target_os = "android")]
         let _lock = android_handler_lock();
+        let _runtime = crate::android_sync_lock::android_runtime_lock();
 
         f(&self.handler)
     }
 }
 
-impl<F> Drop for ProtocolHandler<F> {
+impl<F: 'static> Drop for ProtocolHandler<F> {
     fn drop(&mut self) {
+        // SAFETY: the handler is not used again
+        let handler = unsafe { std::mem::ManuallyDrop::take(&mut self.handler) };
+
         // Wry drops the handler on the activity's thread or a WebView worker thread
         #[cfg(target_os = "android")]
-        let _lock = android_handler_lock();
+        defer_drop(handler);
 
-        // SAFETY: the handler is not used again
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.handler) }
+        #[cfg(not(target_os = "android"))]
+        drop(handler);
     }
 }
 
-/// Serializes calls to and drops of all protocol handlers.
+/// Serializes calls to all protocol handlers.
 ///
-/// Not `android_runtime_lock`: handlers take that themselves.
+/// Taken before `android_runtime_lock` whenever a thread holds both, so the two are always taken
+/// in the same order.
 #[cfg(target_os = "android")]
 fn android_handler_lock() -> std::sync::MutexGuard<'static, ()> {
     static HANDLER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     HANDLER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(any(target_os = "android", test))]
+struct Deferred(#[allow(dead_code)] Box<dyn std::any::Any>);
+
+#[cfg(any(target_os = "android", test))]
+static DEFERRED: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "android", test))]
+fn defer_drop(handler: impl std::any::Any) {
+    DEFERRED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Deferred(Box::new(handler)));
+}
+
+pub(crate) fn drop_deferred_handlers() {
+    #[cfg(any(target_os = "android", test))]
+    {
+        let deferred = std::mem::take(
+            &mut *DEFERRED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop(deferred);
+    }
 }
 
 pub(crate) struct WebviewInstance {
@@ -1180,5 +1216,82 @@ mod page_tests {
         let response = scene.resize(element, None);
         assert_eq!(heard(), 0);
         assert_eq!(response, serde_json::json!({ "preventDefault": false }));
+    }
+
+    struct OnARequestThread<'a>(&'a Scene);
+
+    unsafe impl Send for OnARequestThread<'_> {}
+
+    #[test]
+    fn a_request_waits_for_the_event_loop_to_let_go_of_the_queue_before_it_renders_into_it() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        std::thread::scope(|threads| {
+            let event_loop = crate::android_sync_lock::android_runtime_lock();
+            let polled = scene.edits.wry_queue.hold();
+            let on_a_request_thread = OnARequestThread(&scene);
+            let request = threads.spawn(move || {
+                let on_a_request_thread = on_a_request_thread;
+                on_a_request_thread.0.resize(element, Some(page))
+            });
+            let request_thread = request.thread().id();
+            while !(crate::android_sync_lock::is_waiting(request_thread) || request.is_finished()) {
+                std::thread::yield_now();
+            }
+            assert!(
+                !request.is_finished(),
+                "The request ran while the event loop held the queue."
+            );
+            drop(polled);
+            drop(event_loop);
+            let response = request.join().expect(
+                "The request is answered once the event loop lets go, rather than panicking.",
+            );
+            assert!(answered_with_edits(&response), "{response}");
+        });
+    }
+
+    #[test]
+    fn the_page_is_told_where_its_edits_come_from_without_touching_the_queue() {
+        let scene = Scene::new();
+        let held = scene.edits.wry_queue.hold();
+        let path = scene.edits.wry_queue.edits_path();
+        let key = scene.edits.wry_queue.required_server_key();
+        drop(held);
+        assert!(path.starts_with("ws://127.0.0.1:"), "{path}");
+        assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn a_handler_is_called_holding_the_runtime_lock() {
+        let handler =
+            unsafe { ProtocolHandler::new(crate::android_sync_lock::held_by_this_thread) };
+        assert!(!crate::android_sync_lock::held_by_this_thread());
+        assert!(handler.with(|held| held()));
+        assert!(!crate::android_sync_lock::held_by_this_thread());
+    }
+
+    struct DroppedOn(std::sync::Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>);
+
+    impl Drop for DroppedOn {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn a_handler_let_go_of_on_another_thread_is_dropped_by_the_event_loop() {
+        let dropped_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handed = DroppedOn(dropped_on.clone());
+        std::thread::spawn(move || defer_drop(handed))
+            .join()
+            .unwrap();
+        assert_eq!(*dropped_on.lock().unwrap(), None);
+        drop_deferred_handlers();
+        assert_eq!(
+            *dropped_on.lock().unwrap(),
+            Some(std::thread::current().id())
+        );
     }
 }

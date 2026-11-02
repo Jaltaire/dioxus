@@ -612,7 +612,6 @@ impl App {
         // would go to a channel nothing is reading. Forgetting it first means
         // the edits that rebuild the new page are queued for it instead.
         {
-            #[cfg(target_os = "android")]
             let _lock = crate::android_sync_lock::android_runtime_lock();
             view.edits.wry_queue.forget_connection();
         }
@@ -665,7 +664,6 @@ impl App {
             return;
         };
 
-        #[cfg(target_os = "android")]
         let _lock = crate::android_sync_lock::android_runtime_lock();
 
         if let Arrival::Stale { newest } = view.edits.wry_queue.page_arrived(page) {
@@ -739,7 +737,6 @@ impl App {
             return;
         };
 
-        #[cfg(target_os = "android")]
         let _lock = crate::android_sync_lock::android_runtime_lock();
 
         if !view.edits.wry_queue.is_drawn(page) {
@@ -787,7 +784,6 @@ impl App {
                     {
                         // This is a place where wry says it's threadsafe but it's actually not.
                         // If we're patching the app, we want to make sure it's not going to progress in the interim.
-                        #[cfg(target_os = "android")]
                         let _lock = crate::android_sync_lock::android_runtime_lock();
 
                         if let Err(err) =
@@ -898,7 +894,6 @@ impl App {
 
             {
                 // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers and async tasks
-                #[cfg(target_os = "android")]
                 let _lock = crate::android_sync_lock::android_runtime_lock();
                 let mut dom = self.shared.dom.borrow_mut();
                 let fut = dom.wait_for_work();
@@ -911,7 +906,6 @@ impl App {
             }
 
             // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers
-            #[cfg(target_os = "android")]
             let _lock = crate::android_sync_lock::android_runtime_lock();
 
             self.render_dom_immediate();

@@ -109,6 +109,7 @@ enum Admission {
 pub(crate) struct WryQueue {
     inner: Rc<RefCell<WryQueueInner>>,
     pages: WebviewPagesHandle,
+    location: WebviewWebsocketLocation,
 }
 
 impl WryQueue {
@@ -121,6 +122,11 @@ impl WryQueue {
     /// pass can detect a fresh batch of writes.
     pub(crate) fn clear_touched(&self) {
         self.inner.borrow_mut().touched = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> std::cell::RefMut<'_, WryQueueInner> {
+        self.inner.borrow_mut()
     }
 
     #[inline]
@@ -184,7 +190,7 @@ impl WryQueue {
         let mut inner = self.inner.borrow_mut();
         tracing::info!(
             "Webview {} forgets its edits connection and awaits a page.",
-            inner.location.webview_id
+            self.location.webview_id
         );
         // Until the new page reports in, anything the virtual dom renders is
         // a diff against the page that is gone. Sent on, it would be the first
@@ -210,7 +216,7 @@ impl WryQueue {
     /// Send a list of mutations to the webview
     pub(crate) fn send_edits(&self) {
         let mut myself = self.inner.borrow_mut();
-        let webview_id = myself.location.webview_id;
+        let webview_id = self.location.webview_id;
         let serialized_edits = myself.mutation_state.export_memory();
         let length = serialized_edits.len();
         match self.pages.with(|pages| pages.write(serialized_edits)) {
@@ -305,7 +311,7 @@ impl WryQueue {
     pub(crate) fn edits_path(&self) -> String {
         let WebviewWebsocketLocation {
             webview_id, server, ..
-        } = &self.inner.borrow().location;
+        } = &self.location;
         let server = server.lock().unwrap();
         let port = server.port;
         let key = &server.client_key;
@@ -315,14 +321,13 @@ impl WryQueue {
 
     /// Get the key the client should expect from the server when connecting to the websocket.
     pub(crate) fn required_server_key(&self) -> String {
-        let server = &self.inner.borrow().location.server;
+        let server = &self.location.server;
         let server = server.lock().unwrap();
         encode_key_string(&server.server_key)
     }
 }
 
 pub(crate) struct WryQueueInner {
-    location: WebviewWebsocketLocation,
     // If this webview is currently waiting for an edit to be flushed. We don't run the virtual dom while this is true to avoid running effects before the dom has been updated
     edits_in_progress: Option<oneshot::Receiver<()>>,
     // The socket may be killed by the OS while running. If it does, this channel will receive the new server location
@@ -691,7 +696,6 @@ impl EditWebsocket {
             inner: Rc::new(RefCell::new(WryQueueInner {
                 server_location_changed: server_location.clone(),
                 server_location_changed_future: owned_notify_future(server_location),
-                location: WebviewWebsocketLocation { webview_id, server },
                 edits_in_progress: None,
                 mutation_state: MutationState::default(),
                 touched: false,
@@ -700,6 +704,7 @@ impl EditWebsocket {
                 webview: webview_id,
                 connections: self.connections.clone(),
             },
+            location: WebviewWebsocketLocation { webview_id, server },
         }
     }
 }
