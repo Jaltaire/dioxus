@@ -14,6 +14,7 @@ static EVALS_RECEIVED: GlobalSignal<usize> = Signal::global(|| 0);
 static EVALS_RETURNED: GlobalSignal<usize> = Signal::global(|| 0);
 static RELEASED_EVALS_RETURNED: GlobalSignal<usize> = Signal::global(|| 0);
 const RELEASED_EVALS: usize = 50;
+static FOCUS_ANSWERED: GlobalSignal<usize> = Signal::global(|| 0);
 
 fn app() -> Element {
     // Double 100 values in the value
@@ -77,7 +78,34 @@ fn app() -> Element {
         }
     });
 
+    let mut field = use_signal(|| None::<std::rc::Rc<MountedData>>);
+    use_effect(move || {
+        let Some(field) = field() else {
+            return;
+        };
+        spawn(async move {
+            field.set_focus(true).await.unwrap();
+            let focused: bool = document::eval(
+                "return document.activeElement === document.getElementById('focused');",
+            )
+            .join()
+            .await
+            .unwrap();
+            assert!(focused);
+            field.set_focus(false).await.unwrap();
+            let blurred: bool = document::eval(
+                "return document.activeElement !== document.getElementById('focused');",
+            )
+            .join()
+            .await
+            .unwrap();
+            assert!(blurred);
+            FOCUS_ANSWERED.with_mut(|x| *x += 1);
+        });
+    });
+
     use_memo(|| {
+        println!("expected 1 focus answered found {}", FOCUS_ANSWERED());
         println!("expected 100 evals received found {}", EVALS_RECEIVED());
         println!("expected 2 eval returned found {}", EVALS_RETURNED());
         println!(
@@ -87,10 +115,13 @@ fn app() -> Element {
         if EVALS_RECEIVED() == 100
             && EVALS_RETURNED() == 2
             && RELEASED_EVALS_RETURNED() == RELEASED_EVALS
+            && FOCUS_ANSWERED() == 1
         {
             window().close();
         }
     });
 
-    VNode::empty()
+    rsx! {
+        input { id: "focused", onmounted: move |event| field.set(Some(event.data())) }
+    }
 }

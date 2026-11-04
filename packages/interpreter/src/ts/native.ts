@@ -244,7 +244,7 @@ export class NativeInterpreter extends JSChannel_ {
     }
   }
 
-  setFocus(id: NodeId, focus: boolean) {
+  setFocus(id: NodeId, focus: boolean): boolean {
     const node = this.nodes[id];
 
     if (node instanceof HTMLElement || node instanceof SVGElement) {
@@ -253,7 +253,9 @@ export class NativeInterpreter extends JSChannel_ {
       } else {
         node.blur();
       }
+      return true;
     }
+    return false;
   }
 
   // Windows drag-n-drop fix code. Called by wry drag-n-drop handler over the event loop.
