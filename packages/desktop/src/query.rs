@@ -68,12 +68,24 @@ pub(crate) struct QueryEntry {
 #[derive(Clone, Default)]
 pub(crate) struct QueryEngine {
     pub active_requests: SharedRequests<QueryEntry>,
+    released: Rc<RefCell<Vec<Owner>>>,
+}
+
+pub(crate) struct ReleasedQueries {
+    engine: QueryEngine,
+    owners: Vec<Owner>,
+}
+
+impl ReleasedQueries {
+    pub fn wait_for_the_next_pass(self) {
+        self.engine.released.borrow_mut().extend(self.owners);
+    }
 }
 
 /// Whether a query has a page to run in: one that has reported in, or none,
 /// because the page was lost and its replacement has not reported in yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryPage {
+pub(crate) enum QueryPage {
     Drawn,
     Awaited,
 }
@@ -118,7 +130,7 @@ impl QueryEngine {
         )
     }
 
-    fn start<V: DeserializeOwned>(
+    pub(crate) fn start<V: DeserializeOwned>(
         &self,
         script: &str,
         page: QueryPage,
@@ -204,6 +216,13 @@ impl QueryEngine {
         }
     }
 
+    pub fn released_by_their_pages(&self) -> ReleasedQueries {
+        ReleasedQueries {
+            engine: self.clone(),
+            owners: std::mem::take(&mut *self.released.borrow_mut()),
+        }
+    }
+
     /// Send a query channel message to the correct query
     pub fn send(&self, data: QueryResult) {
         let QueryResult { id, data } = data;
@@ -221,7 +240,9 @@ impl QueryEngine {
                     }
                 }
                 QueryResultData::Drop => {
-                    requests.remove(id);
+                    if let Some(owner) = requests.remove(id).and_then(|released| released.owner) {
+                        self.released.borrow_mut().push(owner);
+                    }
                 }
                 QueryResultData::Send { data } => {
                     let _ = entry.channel_sender.unbounded_send(data);
@@ -451,6 +472,94 @@ mod page_tests {
                 Err(String::from("gone"))
             });
         assert!(query.result().now_or_never().is_none());
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use generational_box::{AnyStorage, UnsyncStorage};
+    use serde_json::json;
+
+    fn started(engine: &QueryEngine, owned: bool) -> usize {
+        let id = engine
+            .start::<Value>("return 1;", QueryPage::Drawn, std::rc::Weak::new(), |_| {
+                Ok(())
+            })
+            .id;
+        if owned {
+            engine
+                .active_requests
+                .requests
+                .borrow_mut()
+                .get_mut(id)
+                .expect("The query was just started.")
+                .owner = Some(UnsyncStorage::owner());
+        }
+        id
+    }
+
+    fn released(engine: &QueryEngine, id: usize) {
+        engine.send(
+            serde_json::from_value(json!({ "id": id, "data": { "method": "drop" } }))
+                .expect("The page's report is well formed."),
+        );
+    }
+
+    #[test]
+    fn a_query_the_page_lets_go_of_leaves_the_active_requests_and_its_owner_waits_for_a_pass() {
+        let engine = QueryEngine::default();
+        let id = started(&engine, true);
+        released(&engine, id);
+        assert!(
+            engine
+                .active_requests
+                .requests
+                .borrow_mut()
+                .get_mut(id)
+                .is_none()
+        );
+        assert_eq!(engine.released_by_their_pages().owners.len(), 1);
+        assert!(engine.released_by_their_pages().owners.is_empty());
+    }
+
+    #[test]
+    fn a_query_without_an_evaluator_leaves_nothing_to_wait_for() {
+        let engine = QueryEngine::default();
+        let id = started(&engine, false);
+        released(&engine, id);
+        assert!(
+            engine
+                .active_requests
+                .requests
+                .borrow_mut()
+                .get_mut(id)
+                .is_none()
+        );
+        assert!(engine.released_by_their_pages().owners.is_empty());
+    }
+
+    #[test]
+    fn a_pass_that_waits_hands_its_owners_to_the_next_alongside_any_released_since() {
+        let engine = QueryEngine::default();
+        let first = started(&engine, true);
+        let second = started(&engine, true);
+        released(&engine, first);
+        let pass = engine.released_by_their_pages();
+        released(&engine, second);
+        pass.wait_for_the_next_pass();
+        assert_eq!(engine.released_by_their_pages().owners.len(), 2);
+    }
+
+    #[test]
+    fn a_release_for_a_query_never_asked_for_or_already_released_holds_nothing_more() {
+        let engine = QueryEngine::default();
+        let id = started(&engine, true);
+        released(&engine, id + 1);
+        assert!(engine.released_by_their_pages().owners.is_empty());
+        released(&engine, id);
+        released(&engine, id);
+        assert_eq!(engine.released_by_their_pages().owners.len(), 1);
     }
 }
 

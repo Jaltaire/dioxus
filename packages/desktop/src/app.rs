@@ -3,7 +3,7 @@ use crate::{
     desktop_state::{DesktopAppContext, WindowCloseRequestResult},
     edits::Arrival,
     ipc::{IpcMessage, PageReport, UserWindowEvent},
-    query::QueryResult,
+    query::{QueryResult, ReleasedQueries},
     waker::create_dom_waker,
     webview::{SharedDom, WebviewInstance},
 };
@@ -886,9 +886,14 @@ impl App {
     pub fn poll_vdom(&mut self) {
         let dom_waker = self.dom_waker.clone();
         let mut cx = std::task::Context::from_waker(&dom_waker);
+        let mut released = Some(self.queries_released_by_their_pages());
 
         loop {
             if self.poll_webview_queues(&mut cx) {
+                released
+                    .into_iter()
+                    .flatten()
+                    .for_each(ReleasedQueries::wait_for_the_next_pass);
                 return;
             }
 
@@ -909,8 +914,16 @@ impl App {
             let _lock = crate::android_sync_lock::android_runtime_lock();
 
             self.render_dom_immediate();
+            drop(released.take());
             self.send_touched_edits();
         }
+    }
+
+    fn queries_released_by_their_pages(&self) -> Vec<ReleasedQueries> {
+        self.webviews
+            .values()
+            .map(|view| view.desktop_context.query.released_by_their_pages())
+            .collect()
     }
 
     /// Build the writer for one render pass: every webview's `WryQueue` keyed

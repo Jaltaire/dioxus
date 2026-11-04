@@ -12,6 +12,8 @@ pub fn main() {
 
 static EVALS_RECEIVED: GlobalSignal<usize> = Signal::global(|| 0);
 static EVALS_RETURNED: GlobalSignal<usize> = Signal::global(|| 0);
+static RELEASED_EVALS_RETURNED: GlobalSignal<usize> = Signal::global(|| 0);
+const RELEASED_EVALS: usize = 50;
 
 fn app() -> Element {
     // Double 100 values in the value
@@ -53,10 +55,39 @@ fn app() -> Element {
         EVALS_RETURNED.with_mut(|x| *x += 1);
     });
 
+    use_future(|| async {
+        let returns = (0..RELEASED_EVALS).map(|index| async move {
+            document::eval(&format!(
+                r#"queueMicrotask(() => queueMicrotask(() => window.ipc.postMessage(JSON.stringify({{
+                    method: "query",
+                    params: {{ id: dioxus.request_id, data: {{ method: "drop" }} }},
+                }}))));
+                return {index};"#
+            ))
+            .join::<usize>()
+            .await
+        });
+        for (index, returned) in futures_util::future::join_all(returns)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(returned.unwrap(), index);
+            RELEASED_EVALS_RETURNED.with_mut(|x| *x += 1);
+        }
+    });
+
     use_memo(|| {
         println!("expected 100 evals received found {}", EVALS_RECEIVED());
         println!("expected 2 eval returned found {}", EVALS_RETURNED());
-        if EVALS_RECEIVED() == 100 && EVALS_RETURNED() == 2 {
+        println!(
+            "expected {RELEASED_EVALS} released evals returned found {}",
+            RELEASED_EVALS_RETURNED()
+        );
+        if EVALS_RECEIVED() == 100
+            && EVALS_RETURNED() == 2
+            && RELEASED_EVALS_RETURNED() == RELEASED_EVALS
+        {
             window().close();
         }
     });
