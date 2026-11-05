@@ -12,7 +12,7 @@ pub(crate) fn process_image(
     if image_options.format() == ImageFormat::Unknown
         && image_options.size() == ImageSize::Automatic
     {
-        return copy_unchanged(source, output_path);
+        return copy_without_metadata(source, output_path);
     }
 
     let mut image = image::ImageReader::new(std::io::Cursor::new(&*std::fs::read(source)?))
@@ -64,6 +64,27 @@ pub(crate) fn process_image(
     }
 
     Ok(())
+}
+
+fn copy_without_metadata(source: &Path, output_path: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(source)
+        .with_context(|| format!("Failed to read image: {}", source.display()))?;
+    match super::image_metadata::without_metadata(&bytes) {
+        Some(kept) => std::fs::write(output_path, kept)
+            .with_context(|| format!("Failed to write image: {}", output_path.display())),
+        None => {
+            if matches!(
+                image::guess_format(&bytes),
+                Ok(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)
+            ) {
+                tracing::warn!(
+                    "The image {} could not be read to leave its metadata behind, so it was copied as it is.",
+                    source.display()
+                );
+            }
+            copy_unchanged(source, output_path)
+        }
+    }
 }
 
 fn copy_unchanged(source: &Path, output_path: &Path) -> anyhow::Result<()> {
@@ -248,12 +269,43 @@ mod tests {
         image::load_from_memory(bytes).expect("The output decodes.")
     }
 
+    fn png_tightly_packed() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, WIDTH, HEIGHT);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Best);
+        encoder.set_filter(png::FilterType::NoFilter);
+        let mut writer = encoder.write_header().expect("The PNG header is written.");
+        writer
+            .write_image_data(picture().to_rgba8().as_raw())
+            .expect("The PNG pixels are written.");
+        writer.finish().expect("The PNG is finished.");
+        bytes
+    }
+
+    fn jpeg_at_quality_95() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&picture().to_rgb8())
+            .expect("The JPEG encodes.");
+        bytes
+    }
+
+    fn encoded_again(bytes: &[u8], encoding: Encoding) -> Vec<u8> {
+        let mut again = std::io::Cursor::new(Vec::new());
+        decoded(bytes)
+            .write_to(&mut again, encoding)
+            .expect("The picture encodes again.");
+        again.into_inner()
+    }
+
     #[test]
-    fn an_image_that_asks_for_no_format_or_size_is_copied_byte_for_byte() {
+    fn an_image_without_metadata_that_asks_for_no_format_or_size_is_copied_byte_for_byte() {
         for (source, extension) in [
-            (png_with_a_text_chunk(), "png"),
-            (jpeg_with_a_comment(), "jpg"),
-            (jpeg_with_a_comment(), "jpeg"),
+            (png_tightly_packed(), "png"),
+            (jpeg_at_quality_95(), "jpg"),
+            (jpeg_at_quality_95(), "jpeg"),
             (LOSSY_WEBP.to_vec(), "webp"),
         ] {
             decoded(&source);
@@ -269,10 +321,10 @@ mod tests {
 
     #[test]
     fn the_fixtures_are_ones_a_fresh_encoding_would_change() {
-        let note = NOTE.as_bytes();
-        for source in [png_with_a_text_chunk(), jpeg_with_a_comment()] {
-            assert!(source.windows(note.len()).any(|window| window == note));
-        }
+        let png = png_tightly_packed();
+        assert_ne!(encoded_again(&png, Encoding::Png), png);
+        let jpeg = jpeg_at_quality_95();
+        assert_ne!(encoded_again(&jpeg, Encoding::Jpeg), jpeg);
         assert_eq!(&LOSSY_WEBP[12..16], b"VP8 ", "The WebP is lossy.");
     }
 
@@ -280,7 +332,7 @@ mod tests {
     fn the_image_builder_left_as_it_is_asks_for_nothing_and_is_copied() {
         let processed = process(
             &options(AssetOptions::image()),
-            png_with_a_text_chunk(),
+            png_tightly_packed(),
             "picture.png",
             "output.png",
         );
@@ -295,8 +347,50 @@ mod tests {
     }
 
     #[test]
+    fn an_image_s_metadata_is_left_behind_when_it_is_copied() {
+        let note = NOTE.as_bytes();
+        for (source, extension) in [
+            (png_with_a_text_chunk(), "png"),
+            (jpeg_with_a_comment(), "jpg"),
+        ] {
+            assert!(source.windows(note.len()).any(|window| window == note));
+            let processed = process(
+                &ImageAssetOptions::default(),
+                source,
+                &format!("picture.{extension}"),
+                &format!("output.{extension}"),
+            );
+            assert!(
+                !processed
+                    .output
+                    .windows(note.len())
+                    .any(|window| window == note),
+                "{extension} keeps its note."
+            );
+            assert_eq!(
+                decoded(&processed.output).to_rgba8(),
+                decoded(&processed.source).to_rgba8(),
+                "{extension}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_that_does_not_decode_is_copied_whatever_its_extension() {
         let bytes = b"These bytes are not a picture.".to_vec();
+        let processed = process(
+            &ImageAssetOptions::default(),
+            bytes,
+            "picture.png",
+            "output.png",
+        );
+        assert_eq!(processed.output, processed.source);
+    }
+
+    #[test]
+    fn a_png_too_broken_to_read_is_copied_as_it_is() {
+        let mut bytes = png_tightly_packed();
+        bytes.truncate(bytes.len() / 2);
         let processed = process(
             &ImageAssetOptions::default(),
             bytes,

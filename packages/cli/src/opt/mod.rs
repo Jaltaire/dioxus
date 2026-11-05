@@ -9,6 +9,7 @@ mod file;
 mod folder;
 mod hash;
 mod image;
+mod image_metadata;
 mod js;
 mod json;
 
