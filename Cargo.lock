@@ -3791,6 +3791,7 @@ dependencies = [
  "dioxus-base-types",
  "dioxus-hooks",
  "dioxus-html-internal-macro",
+ "dioxus-renderer-oracle",
  "dioxus-rsx",
  "dioxus-vdom",
  "dioxus-vdom-macro",

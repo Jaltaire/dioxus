@@ -153,6 +153,29 @@ mod tests {
     }
 
     #[test]
+    fn a_registered_custom_event_that_names_its_page_is_read_with_its_detail() {
+        dioxus_html::events::register_custom_event("ipc-notice", true);
+        let (page, event) = message(serde_json::json!({
+            "name": "ipc-notice",
+            "element": 9,
+            "data": { "detail": "hello" },
+            "bubbles": true,
+            "page": 4,
+        }))
+        .page_event()
+        .expect("A registered custom event naming its page is read.");
+        assert_eq!(page.to_string(), "4");
+        assert_eq!(event.name, "ipc-notice");
+        assert!(event.bubbles);
+        assert_eq!(
+            event.data,
+            EventData::Custom(dioxus_html::SerializedCustomData::new(Some(
+                "hello".to_string()
+            )))
+        );
+    }
+
+    #[test]
     fn an_event_that_does_not_name_its_page_is_not_read() {
         assert!(
             message(serde_json::json!({
