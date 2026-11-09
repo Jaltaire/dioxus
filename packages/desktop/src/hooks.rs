@@ -115,28 +115,6 @@ pub fn use_asset_handler(
     );
 }
 
-/// Provide a thread-safe handler to answer asset requests yourself.
-///
-/// Unlike [`use_asset_handler`], the handler answers on whichever thread the web view asks from,
-/// without waiting for the event loop or for any other request, so it must be `Send` and `Sync`
-/// and cannot reach into a component's signals. It suits a handler that reads only shared,
-/// thread-safe state, such as files on disk. The handler given when the component is first
-/// rendered is the one that answers, and it is removed when the component is dropped.
-pub fn use_thread_safe_asset_handler(
-    name: &str,
-    handler: impl Fn(AssetRequest, RequestAsyncResponder) + Send + Sync + 'static,
-) {
-    use_hook_with_cleanup(
-        || {
-            crate::window().register_thread_safe_asset_handler(name.to_string(), handler);
-            Rc::new(name.to_string())
-        },
-        move |name| {
-            _ = crate::window().asset_handlers.remove_handler(name.as_ref());
-        },
-    );
-}
-
 /// Get a closure that executes any JavaScript in the WebView context.
 pub fn use_global_shortcut(
     accelerator: impl IntoAccelerator,

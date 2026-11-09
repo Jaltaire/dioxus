@@ -3,9 +3,7 @@
 /// We want to acquire this mutex before doing anything with the virtualdom directly, and before
 /// touching anything else the event loop and the webview's request threads both reach. It is
 /// held by the event loop for the whole of every event, and by a request thread for the whole of
-/// every request a protocol handler serves, so the two never run at once. A request for a
-/// thread-safe asset handler takes neither this lock nor the handler lock, because it reaches
-/// nothing either of them guards. A thread that holds it may take it again.
+/// every request, so the two never run at once. A thread that holds it may take it again.
 pub fn android_runtime_lock() -> RuntimeLock {
     #[cfg(any(target_os = "android", test))]
     {
