@@ -321,7 +321,10 @@ impl WebviewEdits {
 /// the webview, except on Android where they run on WebView worker threads. Wry used to hold a
 /// mutex around those calls and its removal of the handler, and since 0.56 no longer does, so
 /// `with` takes a lock of our own there, and the runtime lock the event loop holds, so that no
-/// call runs while the event loop touches what the handler reaches. On Android wry drops the
+/// call runs while the event loop touches what the handler reaches. A request for a thread-safe
+/// asset handler is answered before `with`, taking neither lock: it reaches only the request, its
+/// responder, the handler, and the table of thread-safe handlers, which are all `Send` and `Sync`
+/// and none of which the event loop or another handler holds. On Android wry drops the
 /// handler on the activity's thread or a WebView worker thread, so `drop` hands it to the event
 /// loop, which drops it holding the runtime lock.
 struct ProtocolHandler<F: 'static> {
@@ -523,12 +526,14 @@ impl WebviewInstance {
                 edits
             ];
             let page_begun = page_begun.clone();
+            let thread_safe_handlers = asset_handlers.thread_safe();
+            let thread_safe_policy = resource_response_policy.clone();
 
             #[cfg(feature = "tokio_runtime")]
             let tokio_rt = tokio::runtime::Handle::current();
 
             let handler = move |request: wry::http::Request<Vec<u8>>,
-                                responder: RequestAsyncResponder| {
+                                responder: crate::RequestAsyncResponder| {
                 if request.uri().path() == "/" {
                     page_begun.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -536,7 +541,7 @@ impl WebviewInstance {
                 protocol::desktop_handler(
                     request,
                     asset_handlers.clone(),
-                    crate::RequestAsyncResponder::new(move |response| responder.respond(response)),
+                    responder,
                     &edits,
                     custom_head.clone(),
                     custom_index.clone(),
@@ -552,7 +557,16 @@ impl WebviewInstance {
                 #[cfg(feature = "tokio_runtime")]
                 let _guard = tokio_rt.enter();
 
-                handler.with(|handler| handler(request, responder))
+                let responder =
+                    crate::RequestAsyncResponder::new(move |response| responder.respond(response));
+                if let Some((request, responder)) = protocol::serve_thread_safe_asset(
+                    request,
+                    responder,
+                    &thread_safe_handlers,
+                    &thread_safe_policy,
+                ) {
+                    handler.with(|handler| handler(request, responder))
+                }
             }
         };
 

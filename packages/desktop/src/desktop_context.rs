@@ -411,11 +411,25 @@ impl DesktopService {
             .register_handler(name, Callback::new(move |(req, resp)| handler(req, resp)))
     }
 
-    /// Removes an asset handler by its identifier.
+    /// Provide a thread-safe handler to answer asset requests yourself, on whichever thread the
+    /// web view asks from, without waiting for the event loop or for any other request. It
+    /// replaces any handler of either kind registered under the same name.
+    ///
+    /// See [`crate::use_thread_safe_asset_handler`] for a convenient hook.
+    pub fn register_thread_safe_asset_handler(
+        &self,
+        name: String,
+        handler: impl Fn(AssetRequest, RequestAsyncResponder) + Send + Sync + 'static,
+    ) {
+        self.asset_handlers
+            .register_thread_safe_handler(name, std::sync::Arc::new(handler))
+    }
+
+    /// Removes an asset handler of either kind by its identifier.
     ///
     /// Returns `None` if the handler did not exist.
     pub fn remove_asset_handler(&self, name: &str) -> Option<()> {
-        self.asset_handlers.remove_handler(name).map(|_| ())
+        self.asset_handlers.remove_handler(name)
     }
 
     #[cfg(target_os = "ios")]

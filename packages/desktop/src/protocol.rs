@@ -163,6 +163,45 @@ pub(super) fn desktop_handler(
     serve_asset_request(request, asset_handlers, responder);
 }
 
+/// Answers a request for a thread-safe asset handler on the thread that asked, taking neither the
+/// lock that serializes protocol handlers nor the runtime lock, and hands any other request back
+/// to be served by [`desktop_handler`].
+///
+/// A name is looked up in the same place [`desktop_handler`] looks up asset handlers, after the
+/// page itself, its events, and its file dialogs, so a thread-safe handler can never stand in for
+/// any of those. The response passes the same origin check and the same final verifier as every
+/// other response the page is served.
+pub(super) fn serve_thread_safe_asset(
+    request: Request<Vec<u8>>,
+    responder: RequestAsyncResponder,
+    handlers: &ThreadSafeAssetHandlers,
+    resource_response_policy: &crate::resource_response::ResourceResponsePolicy,
+) -> Option<(Request<Vec<u8>>, RequestAsyncResponder)> {
+    let path = request.uri().path();
+    let handler = match path.split('/').nth(1) {
+        _ if path == "/" => None,
+        Some("__events" | "__file_dialog") | None => None,
+        Some(name) => handlers.get(name),
+    };
+    let Some(handler) = handler else {
+        return Some((request, responder));
+    };
+    let origin = match PageAddress::THIS_PLATFORM.request_origin(&request) {
+        Ok(origin) => origin,
+        Err(response) => {
+            responder.respond(response);
+            return None;
+        }
+    };
+    let responder = resource_response_policy
+        .clone()
+        .responder(path.to_string(), move |response| {
+            responder.respond(origin.response(response));
+        });
+    handler(request, responder);
+    None
+}
+
 fn serve_asset_request(
     request: Request<Vec<u8>>,
     asset_handlers: AssetHandlerRegistry,
@@ -1073,5 +1112,184 @@ mod resource_response_tests {
             serde_json::from_slice::<serde_json::Value>(response.body()).unwrap(),
             serde_json::json!({"preventDefault": false})
         );
+    }
+
+    fn thread_safe_request(path: &str, origin: &str) -> Request<Vec<u8>> {
+        Request::builder()
+            .uri(format!("{}{path}", PageAddress::THIS_PLATFORM.index()))
+            .header(ORIGIN, origin)
+            .body(Vec::new())
+            .unwrap()
+    }
+
+    struct ThreadSafeServing {
+        handed_back: Option<String>,
+        answer: Option<Response<Cow<'static, [u8]>>>,
+    }
+
+    fn serve_thread_safe(
+        path: &str,
+        origin: &str,
+        policy: ResourceResponsePolicy,
+        handlers: &ThreadSafeAssetHandlers,
+    ) -> ThreadSafeServing {
+        let (sender, receiver) = mpsc::channel();
+        let responder =
+            crate::RequestAsyncResponder::new(move |response| sender.send(response).unwrap());
+        let handed_back = serve_thread_safe_asset(
+            thread_safe_request(path, origin),
+            responder,
+            handlers,
+            &policy,
+        )
+        .map(|(request, _)| request.uri().path().to_string());
+        ThreadSafeServing {
+            handed_back,
+            answer: receiver.try_recv().ok(),
+        }
+    }
+
+    fn thread_safe_handlers(
+        names: &[&str],
+        asked: Arc<Mutex<Vec<String>>>,
+    ) -> ThreadSafeAssetHandlers {
+        let registry = AssetHandlerRegistry::new();
+        for name in names {
+            let asked = asked.clone();
+            registry.register_thread_safe_handler(
+                name.to_string(),
+                Arc::new(
+                    move |request: AssetRequest, responder: crate::RequestAsyncResponder| {
+                        asked.lock().unwrap().push(request.uri().path().to_string());
+                        responder.respond(
+                            Response::builder()
+                                .header("content-type", "image/png")
+                                .body(b"Picture bytes.".as_slice())
+                                .unwrap(),
+                        );
+                    },
+                ),
+            );
+        }
+        registry.thread_safe()
+    }
+
+    #[test]
+    fn a_thread_safe_handler_answers_its_own_name_and_hands_back_everything_else() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let handlers = thread_safe_handlers(&["media", "__events", "__file_dialog"], asked.clone());
+        let origin = PageAddress::THIS_PLATFORM.origin();
+        for (path, handed_back) in [
+            ("", "/"),
+            ("__events", "/__events"),
+            ("__file_dialog", "/__file_dialog"),
+            ("assets/app.js", "/assets/app.js"),
+            ("mediaeval/picture.png", "/mediaeval/picture.png"),
+        ] {
+            let serving =
+                serve_thread_safe(path, origin, ResourceResponsePolicy::default(), &handlers);
+            assert_eq!(serving.handed_back.as_deref(), Some(handed_back));
+            assert!(
+                serving.answer.is_none(),
+                "{path} is left for the locked path to answer."
+            );
+        }
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "No thread-safe handler stands in for the page, its events, or its file dialogs."
+        );
+        let serving = serve_thread_safe(
+            "media/picture.png?w=128",
+            origin,
+            ResourceResponsePolicy::default(),
+            &handlers,
+        );
+        assert!(serving.handed_back.is_none());
+        let answer = serving
+            .answer
+            .expect("The handler answered on the asking thread.");
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(answer.body().as_ref(), b"Picture bytes.");
+        assert_eq!(answer.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+        assert_eq!(answer.headers()[VARY], "Origin");
+        assert_eq!(*asked.lock().unwrap(), ["/media/picture.png"]);
+    }
+
+    #[test]
+    fn a_thread_safe_handler_cannot_bypass_the_final_verifier() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let handlers = thread_safe_handlers(&["media"], asked.clone());
+        let serving = serve_thread_safe(
+            "media/picture.png",
+            PageAddress::THIS_PLATFORM.origin(),
+            rejecting(),
+            &handlers,
+        );
+        let answer = serving.answer.expect("The refusal is the answer.");
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert!(answer.body().is_empty());
+        assert_packaged_headers(&answer);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+
+        let policy = ResourceResponsePolicy {
+            verifier: Some(Arc::new(|path, mime, bytes| {
+                path == "/media/picture.png"
+                    && mime == Some("image/png")
+                    && bytes == b"Picture bytes."
+            })),
+            required: true,
+        };
+        let serving = serve_thread_safe(
+            "media/picture.png",
+            PageAddress::THIS_PLATFORM.origin(),
+            policy,
+            &handlers,
+        );
+        let answer = serving.answer.expect("The verified picture is the answer.");
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(answer.body().as_ref(), b"Picture bytes.");
+        assert_packaged_headers(&answer);
+    }
+
+    #[test]
+    fn a_thread_safe_request_from_a_foreign_origin_is_refused_before_its_handler_runs() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let handlers = thread_safe_handlers(&["media"], asked.clone());
+        let serving = serve_thread_safe(
+            "media/picture.png",
+            "https://example.com",
+            ResourceResponsePolicy::default(),
+            &handlers,
+        );
+        assert!(serving.handed_back.is_none());
+        let answer = serving.answer.expect("The refusal is the answer.");
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert!(asked.lock().unwrap().is_empty(), "The handler never ran.");
+    }
+
+    #[test]
+    fn a_thread_safe_request_is_answered_while_the_event_loop_holds_the_runtime_lock() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let handlers = thread_safe_handlers(&["media"], asked);
+        let event_loop = crate::android_sync_lock::android_runtime_lock();
+        let (answered, answer) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            let serving = serve_thread_safe(
+                "media/picture.png",
+                PageAddress::THIS_PLATFORM.origin(),
+                ResourceResponsePolicy::default(),
+                &handlers,
+            );
+            answered
+                .send(serving.answer.map(|response| response.status()))
+                .unwrap();
+        });
+        let status = answer
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("The request is answered while the event loop still holds the runtime lock.");
+        assert!(crate::android_sync_lock::held_by_this_thread());
+        assert_eq!(status, Some(StatusCode::OK));
+        drop(event_loop);
+        request.join().unwrap();
     }
 }
