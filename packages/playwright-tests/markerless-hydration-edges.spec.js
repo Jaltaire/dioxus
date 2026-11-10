@@ -360,3 +360,29 @@ test("an empty slot before an element sibling keeps its parent's id", async ({
   await expect(section).toHaveCount(0);
   expect(errors).toEqual([]);
 });
+
+test("a form with an empty slot before a sibling receives its own submission", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(URL);
+
+  const form = page.locator("#slot-before-element-form");
+  await expect(form).toHaveAttribute("data-dioxus-id", /^\d+$/);
+  await expect(form).toHaveClass("waiting");
+  await page.locator("#slot-before-element-form-submit").click();
+  await expect(page.locator("#slot-before-element-form-count")).toHaveText("1");
+  await expect(form).toHaveClass("submitted");
+  const order = await form.evaluate((el) =>
+    Array.from(el.children).map((child) => child.id)
+  );
+  expect(order).toEqual([
+    "slot-before-element-form-count",
+    "slot-before-element-form-submit",
+  ]);
+
+  await page.locator("#slot-before-element-form-submit").click();
+  await expect(page.locator("#slot-before-element-form-count")).toHaveText("2");
+  expect(errors).toEqual([]);
+});

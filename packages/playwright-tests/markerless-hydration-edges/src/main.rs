@@ -23,6 +23,7 @@ fn app() -> Element {
         NestedTrailingPlaceholder {}
         RemovePlaceholder {}
         SlotBeforeElementSibling {}
+        SlotBeforeElementListener {}
         RootTrailingPlaceholder {}
         SvgHydratedListener {}
         EmptyRootHydration {}
@@ -449,6 +450,25 @@ fn SlotBeforeElementInner() -> Element {
                 onclick: move |_| show.toggle(),
                 "fill"
             }
+        }
+    }
+}
+
+#[component]
+fn SlotBeforeElementListener() -> Element {
+    let mut submissions = use_signal(|| 0);
+    rsx! {
+        form {
+            id: "slot-before-element-form",
+            class: if submissions() > 0 { "submitted" } else { "waiting" },
+            onsubmit: move |event| {
+                event.prevent_default();
+                submissions += 1;
+            },
+            if submissions() > 0 {
+                p { id: "slot-before-element-form-count", "{submissions}" }
+            }
+            button { id: "slot-before-element-form-submit", r#type: "submit", "submit" }
         }
     }
 }
