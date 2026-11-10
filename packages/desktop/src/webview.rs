@@ -71,7 +71,7 @@ pub(crate) struct WebviewEdits {
     queues: Weak<RefCell<BTreeMap<RenderTargetId, WryQueue>>>,
 }
 
-const ANSWERED_IN_THEIR_FRAME: &[&str] = &["resize"];
+const ANSWERED_IN_THEIR_FRAME: &[&str] = &["resize", "scroll"];
 
 pub(crate) fn answered_in_its_frame(name: &str) -> bool {
     ANSWERED_IN_THEIR_FRAME.contains(&name)
@@ -998,22 +998,31 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_is_answered_in_its_frame() {
-        assert!(answered_in_its_frame("resize"));
+    fn a_resize_and_a_scroll_are_answered_in_their_frame() {
+        for name in ["resize", "scroll"] {
+            assert!(answered_in_its_frame(name), "{name}");
+        }
     }
 
     #[test]
     fn every_other_event_is_answered_the_usual_way() {
         for name in [
             "click",
-            "scroll",
+            "scrollend",
+            "wheel",
             "touchstart",
             "touchmove",
+            "pointerdown",
+            "pointermove",
+            "pointerup",
+            "pointercancel",
+            "mousemove",
             "input",
             "mounted",
             "visible",
             "resized",
             "Resize",
+            "Scroll",
             "",
         ] {
             assert!(!answered_in_its_frame(name), "{name}");
@@ -1044,7 +1053,7 @@ mod page_tests {
     use super::*;
     use crate::edits::{Arrival, EditWebsocket, PAGE_HEADER, Page};
     use dioxus::prelude::*;
-    use dioxus_html::{SerializedResizeData, geometry::PixelsSize};
+    use dioxus_html::{SerializedResizeData, SerializedScrollData, geometry::PixelsSize};
     use dioxus_vdom::{ElementId, Mutation, Mutations};
     use std::cell::Cell;
 
@@ -1057,6 +1066,22 @@ mod page_tests {
         rsx! {
             div {
                 onresize: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                onscroll: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                onpointermove: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                onpointerdown: move |_| {
+                    HEARD.with(|heard| heard.set(heard.get() + 1));
+                    sized += 1;
+                },
+                onpointerup: move |_| {
                     HEARD.with(|heard| heard.set(heard.get() + 1));
                     sized += 1;
                 },
@@ -1113,14 +1138,85 @@ mod page_tests {
         }
 
         fn resize(&self, element: ElementId, page: Option<Page>) -> serde_json::Value {
+            self.send(
+                "resize",
+                false,
+                element,
+                page,
+                serde_json::to_value(SerializedResizeData::new(
+                    PixelsSize::new(320.0, 640.0),
+                    PixelsSize::new(320.0, 640.0),
+                ))
+                .unwrap(),
+            )
+        }
+
+        fn scroll(&self, element: ElementId, page: Option<Page>) -> serde_json::Value {
+            self.send(
+                "scroll",
+                false,
+                element,
+                page,
+                serde_json::to_value(SerializedScrollData {
+                    scroll_top: 120.0,
+                    scroll_left: 0.0,
+                    scroll_width: 320,
+                    scroll_height: 1280,
+                    client_width: 320,
+                    client_height: 640,
+                })
+                .unwrap(),
+            )
+        }
+
+        fn pointer(&self, name: &str, element: ElementId, page: Option<Page>) -> serde_json::Value {
+            self.send(
+                name,
+                true,
+                element,
+                page,
+                serde_json::json!({
+                    "alt_key": false,
+                    "button": 0,
+                    "buttons": 1,
+                    "client_x": 40.0,
+                    "client_y": 80.0,
+                    "ctrl_key": false,
+                    "meta_key": false,
+                    "offset_x": 40.0,
+                    "offset_y": 80.0,
+                    "page_x": 40.0,
+                    "page_y": 80.0,
+                    "screen_x": 40.0,
+                    "screen_y": 80.0,
+                    "shift_key": false,
+                    "pointer_id": 1,
+                    "width": 1.0,
+                    "height": 1.0,
+                    "pressure": 0.5,
+                    "tangential_pressure": 0.0,
+                    "tilt_x": 0,
+                    "tilt_y": 0,
+                    "twist": 0,
+                    "pointer_type": "touch",
+                    "is_primary": true,
+                }),
+            )
+        }
+
+        fn send(
+            &self,
+            name: &str,
+            bubbles: bool,
+            element: ElementId,
+            page: Option<Page>,
+            data: serde_json::Value,
+        ) -> serde_json::Value {
             let event = serde_json::json!({
-                "name": "resize",
+                "name": name,
                 "element": element,
-                "bubbles": false,
-                "data": SerializedResizeData::new(
-                    PixelsSize::new(320.0, 640.0),
-                    PixelsSize::new(320.0, 640.0),
-                ),
+                "bubbles": bubbles,
+                "data": data,
             });
             let mut request = wry::http::Request::builder()
                 .uri(format!(
@@ -1161,6 +1257,28 @@ mod page_tests {
         let response = scene.resize(element, Some(page));
         assert_eq!(heard(), 1);
         assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn a_scroll_from_the_page_drawn_into_is_answered_in_its_frame() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        let response = scene.scroll(element, Some(page));
+        assert_eq!(heard(), 1);
+        assert!(answered_with_edits(&response), "{response}");
+    }
+
+    #[test]
+    fn a_pointer_drag_is_handled_and_left_to_the_event_loop_to_draw() {
+        let scene = Scene::new();
+        let page = scene.edits.wry_queue.serve_page();
+        let element = scene.draw(page);
+        for (name, heard_by_then) in [("pointerdown", 1), ("pointermove", 2), ("pointerup", 3)] {
+            let response = scene.pointer(name, element, Some(page));
+            assert_eq!(heard(), heard_by_then, "{name}");
+            assert_eq!(response, serde_json::json!({ "preventDefault": false }), "{name}");
+        }
     }
 
     #[test]
