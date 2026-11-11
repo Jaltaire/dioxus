@@ -86,12 +86,14 @@ fn mounted_sent(liveview: bool) -> String {
                 return {{ preventDefault: false, stopPropagation: false }};
             }}
             {send_mounted}
+            {send_without_answer}
             {send_ipc}
         }}
         new Page().sendMountedEvent({{ name: "mounted", element: 5, data: null, bubbles: false }});
         JSON.stringify({{ told, posted }})
         "#,
         send_mounted = common::method(NATIVE_JS, "sendMountedEvent"),
+        send_without_answer = common::method(NATIVE_JS, "sendEventWithoutAnswer"),
         send_ipc = common::method(NATIVE_JS, "sendIpcMessage"),
     );
     let mut context = boa_engine::Context::default();

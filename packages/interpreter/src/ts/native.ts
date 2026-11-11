@@ -353,6 +353,11 @@ export class NativeInterpreter extends JSChannel_ {
       bubbles,
     };
 
+    if (answersNothing(event)) {
+      this.sendEventWithoutAnswer(body);
+      return;
+    }
+
     // liveview does not have synchronous event handling, so we need to send the event to the host
     if (
       this.liveview &&
@@ -388,6 +393,15 @@ export class NativeInterpreter extends JSChannel_ {
   }
 
   sendMountedEvent(body: {
+    name: string;
+    element: number;
+    data: any;
+    bubbles: boolean;
+  }) {
+    this.sendEventWithoutAnswer(body);
+  }
+
+  sendEventWithoutAnswer(body: {
     name: string;
     element: number;
     data: any;
@@ -615,6 +629,15 @@ function handleVirtualdomEventSync(
 
   // Deserialize the response, and then prevent the default/capture the event if the virtualdom wants to
   return JSON.parse(xhr.responseText);
+}
+
+function answersNothing(event: Event): boolean {
+  return (
+    event instanceof CustomEvent &&
+    !event.isTrusted &&
+    !event.cancelable &&
+    !event.bubbles
+  );
 }
 
 function getTargetId(target: EventTarget): NodeId | null {
