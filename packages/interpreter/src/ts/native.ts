@@ -631,12 +631,17 @@ function handleVirtualdomEventSync(
   return JSON.parse(xhr.responseText);
 }
 
+const TOLD_ATTRIBUTE = "data-dioxus-told";
+
 function answersNothing(event: Event): boolean {
+  const target = event.target;
   return (
     event instanceof CustomEvent &&
     !event.isTrusted &&
     !event.cancelable &&
-    !event.bubbles
+    !event.bubbles &&
+    target instanceof Element &&
+    target.hasAttribute(TOLD_ATTRIBUTE)
   );
 }
 

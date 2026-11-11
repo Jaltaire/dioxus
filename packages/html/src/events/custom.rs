@@ -5,6 +5,8 @@ use super::EventHandlerValue;
 /// An event dispatched in the page under a name registered with [`register_event!`](crate::register_event).
 pub type CustomEvent = Event<CustomData>;
 
+pub const TOLD_ATTRIBUTE: &str = "data-dioxus-told";
+
 /// The data of a custom event: the `detail` it was dispatched with, when that is a string.
 pub struct CustomData {
     inner: Box<dyn HasCustomData>,

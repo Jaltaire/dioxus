@@ -1,8 +1,13 @@
+use dioxus_html::TOLD_ATTRIBUTE;
 use dioxus_interpreter_js::NATIVE_JS;
 
 mod common;
 
 fn handled(event: &str, listener_bubbles: bool, liveview: bool) -> String {
+    on(event, &[TOLD_ATTRIBUTE], listener_bubbles, liveview)
+}
+
+fn on(event: &str, marks: &[&str], listener_bubbles: bool, liveview: bool) -> String {
     let program = format!(
         r#"
         var told = [];
@@ -10,15 +15,19 @@ fn handled(event: &str, listener_bubbles: bool, liveview: bool) -> String {
         var applied = [];
         var prevented = [];
         class Node {{}}
-        class Element extends Node {{}}
+        class Element extends Node {{
+            constructor(marks) {{ super(); this.marks = marks; }}
+            hasAttribute(name) {{ return this.marks.includes(name); }}
+        }}
         class HTMLInputElement extends Element {{}}
+        const marks = {marks};
         class Event {{
             constructor(type, init = {{}}) {{
                 this.type = type;
                 this.bubbles = !!init.bubbles;
                 this.cancelable = !!init.cancelable;
                 this.isTrusted = !!init.trusted;
-                this.target = new Element();
+                this.target = new Element(marks);
             }}
             preventDefault() {{ prevented.push(this.type); }}
             stopPropagation() {{}}
@@ -33,6 +42,7 @@ fn handled(event: &str, listener_bubbles: bool, liveview: bool) -> String {
         function serializeEvent(event, target) {{
             return {{ detail: event.detail === undefined ? null : event.detail }};
         }}
+        const TOLD_ATTRIBUTE = {told:?};
         function {answers_nothing}
         class Page {{
             constructor() {{
@@ -61,6 +71,8 @@ fn handled(event: &str, listener_bubbles: bool, liveview: bool) -> String {
         new Page().handleEvent({event}, "heard", {listener_bubbles});
         JSON.stringify({{ told, posted, applied, prevented }})
         "#,
+        marks = serde_json::to_string(marks).unwrap(),
+        told = TOLD_ATTRIBUTE,
         answers_nothing = common::method(NATIVE_JS, "answersNothing"),
         handle_event = common::method(NATIVE_JS, "handleEvent"),
         send_without_answer = common::method(NATIVE_JS, "sendEventWithoutAnswer"),
@@ -79,7 +91,42 @@ fn handled(event: &str, listener_bubbles: bool, liveview: bool) -> String {
 const ASKED: &str = r#"{"told":[{"name":"heard","data":{"detail":null},"element":5,"bubbles":false}],"posted":[],"applied":["drawn"],"prevented":["heard"]}"#;
 
 #[test]
-fn an_event_the_page_dispatched_that_can_neither_be_cancelled_nor_travel_is_posted_with_its_page_and_holds_nothing()
+fn the_shipped_script_reads_the_mark_by_the_name_the_html_crate_gives_it() {
+    assert_eq!(TOLD_ATTRIBUTE, "data-dioxus-told");
+    assert_eq!(
+        NATIVE_JS
+            .matches(&format!("TOLD_ATTRIBUTE={TOLD_ATTRIBUTE:?};"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_event_dispatched_on_an_element_that_is_not_marked_waits_for_its_answer_and_draws_what_it_brings_in_frame()
+ {
+    assert_eq!(on(r#"new CustomEvent("heard")"#, &[], false, false), ASKED);
+    assert_eq!(
+        on(r#"new CustomEvent("heard")"#, &["data-dioxus-id"], false, false),
+        ASKED
+    );
+}
+
+#[test]
+fn the_interpreter_s_own_resize_and_visible_events_on_an_unmarked_element_wait_for_their_answer() {
+    for name in ["resize", "visible"] {
+        assert_eq!(
+            on(&format!("new CustomEvent({name:?})"), &[], false, false),
+            ASKED.replace(
+                r#""prevented":["heard"]"#,
+                &format!(r#""prevented":["{name}"]"#)
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn an_event_the_page_dispatched_on_a_marked_element_that_can_neither_be_cancelled_nor_travel_is_posted_with_its_page_and_holds_nothing()
 {
     assert_eq!(
         handled(r#"new CustomEvent("heard", { detail: { pressed: 1 } })"#, false, false),
@@ -96,7 +143,7 @@ fn a_liveview_page_sends_such_an_event_as_it_sends_a_mounted_one_and_reads_no_an
 }
 
 #[test]
-fn an_event_the_page_dispatched_that_may_be_cancelled_waits_for_its_answer() {
+fn an_event_the_page_dispatched_on_a_marked_element_that_may_be_cancelled_waits_for_its_answer() {
     assert_eq!(
         handled(r#"new CustomEvent("heard", { cancelable: true })"#, false, false),
         ASKED
@@ -104,7 +151,7 @@ fn an_event_the_page_dispatched_that_may_be_cancelled_waits_for_its_answer() {
 }
 
 #[test]
-fn an_event_the_page_dispatched_that_travels_waits_for_its_answer() {
+fn an_event_the_page_dispatched_on_a_marked_element_that_travels_waits_for_its_answer() {
     assert_eq!(
         handled(r#"new CustomEvent("heard", { bubbles: true })"#, false, false),
         ASKED

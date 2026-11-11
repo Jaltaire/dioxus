@@ -47,3 +47,5 @@ minimal_bindings = []
 
 [dev-dependencies]
 boa_engine = "0.22.0"
+dioxus-html = { workspace = true }
+serde_json = { workspace = true }
