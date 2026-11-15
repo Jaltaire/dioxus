@@ -48,6 +48,18 @@ pub fn create_element_in_head(
     format!(r#"{helpers};window.createElementInHead({tag}, {attributes}, {children});"#)
 }
 
+pub fn start_module_in_head(src: &str) -> String {
+    let helpers = include_str!("./js/head.js");
+    let src = format_string_for_js(src);
+    format!(r#"{helpers};window.startModuleInHead({src});"#)
+}
+
+pub fn await_module_in_head(src: &str) -> String {
+    let helpers = include_str!("./js/head.js");
+    let src = format_string_for_js(src);
+    format!(r#"{helpers};return await window.startModuleInHead({src});"#)
+}
+
 /// A provider for document-related functionality.
 ///
 /// Provides things like a history API, a title, a way to run JS, and some other basics/essentials used
@@ -106,6 +118,10 @@ pub trait Document: 'static {
         self.create_head_element("link", &attributes, None);
     }
 
+    fn start_module(&self, src: String) -> Eval {
+        self.eval(await_module_in_head(&src))
+    }
+
     /// Check if we should create a new head component at all. If it returns false, the head component will be skipped.
     ///
     /// This runs once per head component and is used to hydrate head components in fullstack.
@@ -149,4 +165,41 @@ impl Document for NoOpDocument {
     fn create_script(&self, _: ScriptProps) {}
     fn create_style(&self, _: StyleProps) {}
     fn create_link(&self, _: LinkProps) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HELPERS: &str = include_str!("./js/head.js");
+
+    #[test]
+    fn a_module_is_started_from_its_own_script_after_the_head_helpers() {
+        let started = start_module_in_head("/assets/page.mjs");
+        assert!(started.starts_with(HELPERS));
+        assert!(started.ends_with(r#";window.startModuleInHead("/assets/page.mjs");"#));
+    }
+
+    #[test]
+    fn an_awaited_start_answers_with_the_module_s_own_start() {
+        let awaited = await_module_in_head("/assets/page.mjs");
+        assert!(awaited.starts_with(HELPERS));
+        assert!(
+            awaited.ends_with(r#";return await window.startModuleInHead("/assets/page.mjs");"#)
+        );
+    }
+
+    #[test]
+    fn a_script_s_address_cannot_leave_its_string() {
+        let address = "/a\"b\\c\nd\re.mjs";
+        let expected = r#"("/a\"b\\c\nd\re.mjs");"#;
+        assert!(start_module_in_head(address).ends_with(expected));
+        assert!(await_module_in_head(address).ends_with(expected));
+    }
+
+    #[test]
+    fn the_head_helpers_start_a_module_by_importing_its_script() {
+        assert!(HELPERS.contains("window.startModuleInHead=startModuleInHead"));
+        assert!(include_str!("./ts/head.ts").contains("await import(src);"));
+    }
 }

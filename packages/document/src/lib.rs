@@ -29,3 +29,7 @@ pub fn document() -> Rc<dyn Document> {
 pub fn eval(script: &str) -> Eval {
     document().eval(script.to_string())
 }
+
+pub fn start_module(src: &str) -> Eval {
+    document().start_module(src.to_string())
+}
