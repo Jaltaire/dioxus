@@ -5,7 +5,7 @@ use crate::{
 };
 use dioxus_document::{
     Document, Eval, EvalError, Evaluator, LinkProps, MetaProps, ScriptProps, StyleProps,
-    create_element_in_head,
+    await_module_in_head, create_element_in_head, start_module_in_head,
 };
 use dioxus_vdom::queue_effect;
 
@@ -94,6 +94,13 @@ impl Document for DesktopDocument {
             let js = create_element_in_head("link", &props.attributes(), None);
             myself.put_in_head(js);
         });
+    }
+
+    fn start_module(&self, src: String) -> Eval {
+        if let Some(ctx) = self.desktop_ctx.upgrade() {
+            ctx.remember_head_element(start_module_in_head(&src));
+        }
+        self.eval(await_module_in_head(&src))
     }
 }
 

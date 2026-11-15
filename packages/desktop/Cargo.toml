@@ -147,6 +147,11 @@ path = "headless_tests/eval.rs"
 harness = false
 
 [[test]]
+name = "check_modules"
+path = "headless_tests/modules.rs"
+harness = false
+
+[[test]]
 name = "check_multiwindow"
 path = "headless_tests/multiwindow.rs"
 harness = false

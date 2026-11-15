@@ -17,3 +17,10 @@ function createElementInHead(
 
 // @ts-ignore
 window.createElementInHead = createElementInHead;
+
+async function startModuleInHead(src: string): Promise<null> {
+  await import(src);
+  return null;
+}
+
+(window as any).startModuleInHead = startModuleInHead;
