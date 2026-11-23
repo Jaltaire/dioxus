@@ -149,3 +149,63 @@ fn keyed_rows_grow_and_insert_after_adjacent_siblings_swap() {
 
     assert_every_flip_matches_a_fresh_build(app);
 }
+
+#[component]
+fn LeadingRow(on: bool) -> Element {
+    rsx! {
+        span {}
+        if on {
+            b {}
+        }
+    }
+}
+
+#[test]
+fn row_with_a_static_first_root_re_renders_after_an_earlier_sibling_empties() {
+    fn app() -> Element {
+        let odd = generation() % 2 == 1;
+        rsx! {
+            div {
+                if !odd {
+                    span { class: "earlier" }
+                }
+                for i in 0..1 {
+                    LeadingRow { key: "{i}", on: odd }
+                }
+            }
+        }
+    }
+
+    assert_every_flip_matches_a_fresh_build(app);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowKind {
+    Timed,
+    Untimed,
+}
+
+#[test]
+fn row_inside_a_match_of_an_unkeyed_list_re_renders_as_a_marker_toggles() {
+    fn app() -> Element {
+        let odd = generation() % 2 == 1;
+        let kinds = [RowKind::Timed, RowKind::Untimed];
+        rsx! {
+            div {
+                if odd {
+                    hr {}
+                }
+                for (i, kind) in kinds.into_iter().enumerate() {
+                    match kind {
+                        RowKind::Timed => rsx! {
+                            Row { key: "{i}", on: odd }
+                        },
+                        RowKind::Untimed => rsx! {},
+                    }
+                }
+            }
+        }
+    }
+
+    assert_every_flip_matches_a_fresh_build(app);
+}
