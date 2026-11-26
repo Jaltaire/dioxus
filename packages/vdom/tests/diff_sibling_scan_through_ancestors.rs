@@ -209,3 +209,44 @@ fn row_inside_a_match_of_an_unkeyed_list_re_renders_as_a_marker_toggles() {
 
     assert_every_flip_matches_a_fresh_build(app);
 }
+
+#[component]
+fn ReplacedItem(current: usize) -> Element {
+    rsx! {
+        for i in current..current + 1 {
+            p { key: "{i}", "{i}" }
+        }
+    }
+}
+
+#[component]
+fn Pane(closed: bool, current: usize) -> Element {
+    rsx! {
+        if closed {
+            hr {}
+        } else {
+            ReplacedItem { current }
+        }
+    }
+}
+
+#[test]
+fn keyed_item_is_replaced_two_components_below_an_earlier_sibling_that_empties() {
+    fn app() -> Element {
+        let current = generation();
+        let odd = current % 2 == 1;
+        rsx! {
+            div {
+                if !odd {
+                    span { class: "earlier" }
+                }
+                Pane { closed: false, current }
+                if odd {
+                    span { class: "later" }
+                }
+            }
+        }
+    }
+
+    assert_every_flip_matches_a_fresh_build(app);
+}
