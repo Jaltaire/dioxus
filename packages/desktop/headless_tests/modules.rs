@@ -19,6 +19,10 @@ const COUNTED: &str = "/modules/counted.mjs";
 const COUNTED_SOURCE: &str = "window.moduleRuns = (window.moduleRuns ?? 0) + 1; window.dispatchEvent(new Event('module-ran'));";
 const MISSING: &str = "/no-such-module.mjs";
 const REFUSAL: &str = "the module refused to start";
+const PAGE_BASE: &str = "/modules/based/";
+const BASED: &str = "/modules/based/module.mjs";
+const BASED_FROM_THE_PAGE_BASE: &str = "./module.mjs";
+const BASED_SOURCE: &str = "window.basedRuns = (window.basedRuns ?? 0) + 1;";
 
 const GATED_MODULE: &str = r#"
     window.moduleGate = new Promise((resolve) => { window.openModuleGate = resolve; });
@@ -36,14 +40,18 @@ const THROWING_MODULE: &str = r#"
 "#;
 
 fn serve_modules(request: AssetRequest, responder: RequestAsyncResponder) {
-    let response = if request.uri().path() == COUNTED {
-        Response::builder()
+    let source = match request.uri().path() {
+        COUNTED => Some(COUNTED_SOURCE),
+        BASED => Some(BASED_SOURCE),
+        _ => None,
+    };
+    let response = match source {
+        Some(source) => Response::builder()
             .header("Content-Type", "text/javascript")
-            .body(COUNTED_SOURCE.as_bytes().to_vec())
-    } else {
-        Response::builder()
+            .body(source.as_bytes().to_vec()),
+        None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Vec::new())
+            .body(Vec::new()),
     };
     responder.respond(response.expect("The response is well formed."));
 }
@@ -152,7 +160,29 @@ async fn replacing_page() {
         1,
         "Starting a module the replacing page already runs does not run it again."
     );
+    a_module_s_address_is_resolved_against_the_page_s_base().await;
     window().close();
+}
+
+async fn a_module_s_address_is_resolved_against_the_page_s_base() {
+    document::eval(&format!(
+        "const base = document.createElement('base'); base.href = '{PAGE_BASE}'; document.head.prepend(base); return null;"
+    ))
+    .await
+    .expect("The page takes a base.");
+    let started = document::start_module(BASED_FROM_THE_PAGE_BASE).await;
+    document::eval("document.querySelector('base').remove(); return null;")
+        .await
+        .expect("The page drops its base.");
+    assert!(
+        started.is_ok(),
+        "A module whose address is relative to the page's base is started: {started:?}"
+    );
+    assert_eq!(
+        ran("basedRuns").await,
+        1,
+        "A module is found where the page's base says it is."
+    );
 }
 
 fn app() -> Element {

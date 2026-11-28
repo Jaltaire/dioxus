@@ -19,7 +19,7 @@ function createElementInHead(
 window.createElementInHead = createElementInHead;
 
 async function startModuleInHead(src: string): Promise<null> {
-  await import(src);
+  await import(new URL(src, document.baseURI).href);
   return null;
 }
 

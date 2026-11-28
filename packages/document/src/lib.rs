@@ -30,6 +30,10 @@ pub fn eval(script: &str) -> Eval {
     document().eval(script.to_string())
 }
 
+/// Start the module whose script is at `src` in the current document.
+///
+/// `src` is resolved against the document as a script element's `src` is; see
+/// `Document::start_module` for how the address is read and when the start is answered.
 pub fn start_module(src: &str) -> Eval {
     document().start_module(src.to_string())
 }

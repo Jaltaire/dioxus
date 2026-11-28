@@ -118,6 +118,13 @@ pub trait Document: 'static {
         self.create_head_element("link", &attributes, None);
     }
 
+    /// Start the module whose script is at `src`, answering once it has run, or with its error
+    /// if its script cannot be found or throws as it runs.
+    ///
+    /// `src` is an address, read as a script element's `src` is: it is resolved against the
+    /// document's base URL, so a relative address names a file relative to the page and is
+    /// never taken as a bare module specifier. A module started again in the same page does not
+    /// run again.
     fn start_module(&self, src: String) -> Eval {
         self.eval(await_module_in_head(&src))
     }
@@ -198,8 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn the_head_helpers_start_a_module_by_importing_its_script() {
+    fn the_head_helpers_import_a_module_from_its_address_resolved_against_the_document() {
         assert!(HELPERS.contains("window.startModuleInHead=startModuleInHead"));
-        assert!(include_str!("./ts/head.ts").contains("await import(src);"));
+        assert!(HELPERS.contains("import(new URL(src,document.baseURI).href)"));
+        assert!(
+            include_str!("./ts/head.ts")
+                .contains("await import(new URL(src, document.baseURI).href);")
+        );
     }
 }
